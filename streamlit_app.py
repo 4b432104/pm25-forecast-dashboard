@@ -75,12 +75,12 @@ def main():
 
     with st.spinner("🔮 正在執行 application.main() 進行滾動推論..."):
         try:
-            # 呼叫你原本寫好的 main 流程 (會自動執行推論並寫入 SQLite)
+            # 呼叫你原本寫好的 main 流程
             application.main()
         except Exception as e:
             st.warning(f"背景主程式執行提示: {e}")
 
-        # ✅ 修正一：優先讀取你建立的 pm25_forecast.db
+        # 優先讀取 pm25_forecast.db
         db_file = os.path.join(current_dir, "pm25_forecast.db")
         if not os.path.exists(db_file):
             db_file = os.path.join(current_dir, "pm25_data.db")
@@ -89,28 +89,30 @@ def main():
             try:
                 conn = sqlite3.connect(db_file)
 
-                # ✅ 修正二：動態支援 pred_pm25 與 predicted_pm25 欄位名
+                # 💡 精準查詢：先找出「最新一次推論」的 base_time，再抓出該批次的 24 筆預測
+                query = """
+                    SELECT target_time, pred_pm25 AS predicted_pm25, step
+                    FROM predictions
+                    WHERE base_time = (SELECT MAX(base_time) FROM predictions)
+                    ORDER BY step ASC
+                    LIMIT 24
+                """
                 try:
-                    query = """
-                        SELECT target_time, pred_pm25 AS predicted_pm25 
-                        FROM predictions 
-                        ORDER BY id DESC LIMIT 24
-                    """
                     df_pred = pd.read_sql_query(query, conn)
                 except Exception:
+                    # 備援：若舊表沒有 step 或 base_time，退回按 id 排序
                     query_backup = """
                         SELECT target_time, predicted_pm25 
                         FROM predictions 
                         ORDER BY id DESC LIMIT 24
                     """
                     df_pred = pd.read_sql_query(query_backup, conn)
+                    if not df_pred.empty:
+                        df_pred = df_pred.iloc[::-1].reset_index(drop=True)
 
-                if not df_pred.empty:
-                    df_pred = df_pred.iloc[::-1].reset_index(drop=True)
                 conn.close()
             except Exception as e:
                 st.error(f"讀取 SQLite 預測數據失敗: {e}")
-
     # 5. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
         df_pred["display_time"] = pd.to_datetime(
