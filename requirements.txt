@@ -3,3 +3,5 @@ pandas
 plotly
 beautifulsoup4
 requests
+scikit-learn
+numpy
