@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# 引用你原本完全未修改的 application.py 與 db_manager.py
+# 引用原本未修改的 application.py 與 db_manager.py
 import application
 import db_manager
 
@@ -33,8 +33,8 @@ def main():
     current_time_str = now.strftime("%Y-%m-%d %H:00")
     st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
 
-    # 執行與呼叫原本 application.py 裡面的即時資料抓取
-    with st.spinner("📡 正在呼叫爬蟲與模型推論..."):
+    # 1. 抓取即時資料
+    with st.spinner("📡 正在擷取霧峰即時監測數據..."):
         try:
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
@@ -42,7 +42,7 @@ def main():
             st.error(f"擷取即時特徵時發生錯誤: {e}")
             return
 
-    # **頂部即時指標卡片** (對應原本 14 項特徵順序)
+    # 2. 頂部即時指標卡片
     st.subheader("📊 即時監測數據 Summary")
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("即時 PM2.5", f"{live_features_list[7]:.1f} µg/m³")
@@ -53,29 +53,38 @@ def main():
 
     st.markdown("---")
 
-    # **觸發背景預測與 SQLite 寫入 (直接執行你原本寫好的 application.main)**
+    # 3. 觸發模型推論
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
-    # 檢查模型權重是否存在
     model_path = "best_model_ExpC_Cyclic.pth"
     if not os.path.exists(model_path):
-        st.error(
-            f"❌ 找不到模型權重檔 `{model_path}`，請確認已將權重檔上傳至"
-            " GitHub！"
-        )
+        st.error(f"❌ 找不到模型權重檔 `{model_path}`，請確認檔案已上傳至 GitHub！")
         return
 
-    # 執行原本 application.py 的流程來計算預測值並更新資料庫
-    with st.spinner("🔮 正在進行 LSTM 滾動推論..."):
-        application.main()
-
-    # **修正處：改用標準 sqlite3 連線讀取 SQLite 資料庫 (pm25_data.db)**
-    df_pred = pd.DataFrame()
-    db_file = "pm25_data.db"
-
-    if os.path.exists(db_file):
+    with st.spinner("🔮 正在執行 LSTM 滾動推論並寫入資料庫..."):
         try:
-            conn = sqlite3.connect(db_file)
+            application.main()
+        except Exception as e:
+            st.warning(f"執行應用主程式推論時發生警告: {e}")
+
+    # 4. 讀取預測數據 (多重自動尋找 SQLite 資料庫路徑)
+    df_pred = pd.DataFrame()
+    possible_paths = [
+        "pm25_data.db",
+        os.path.join(os.getcwd(), "pm25_data.db"),
+        "/mount/src/pm25-forecast-dashboard/pm25_data.db",
+    ]
+
+    target_db_path = None
+    for p in possible_paths:
+        if os.path.exists(p):
+            target_db_path = p
+            break
+
+    if target_db_path:
+        try:
+            conn = sqlite3.connect(target_db_path)
+            # 優先嘗試查詢當前時間，如果無資料則抓取最新的 24 筆預測
             query = """
                 SELECT target_time, predicted_pm25 
                 FROM predictions 
@@ -83,22 +92,30 @@ def main():
                 ORDER BY target_time ASC
             """
             df_pred = pd.read_sql_query(query, conn, params=(current_time_str,))
+            
+            # 若剛剛寫入的時間格式有些微落差， fallback 取最新寫入的 24 筆
+            if df_pred.empty:
+                query_fallback = """
+                    SELECT target_time, predicted_pm25 
+                    FROM predictions 
+                    ORDER BY id DESC LIMIT 24
+                """
+                df_pred = pd.read_sql_query(query_fallback, conn)
+                df_pred = df_pred.iloc[::-1]  # 轉回正序
+
             conn.close()
         except Exception as e:
-            st.warning(f"讀取 SQLite 數據庫時發生提示: {e}")
-    else:
-        st.warning(f"⚠️ 找不到 `{db_file}` 資料庫檔案")
+            st.warning(f"讀取 SQLite 數據時發生錯誤: {e}")
 
+    # 5. 渲染 Plotly 圖表與表格
     if not df_pred.empty:
-        # 整理時間格式
         df_pred["display_time"] = pd.to_datetime(
             df_pred["target_time"]
         ).dt.strftime("%m/%d %H:00")
 
-        # **繪製互動式 Plotly 折線圖**
         fig = go.Figure()
 
-        # 現況實測點
+        # 當前實測點
         fig.add_trace(
             go.Scatter(
                 x=[now.strftime("%m/%d %H:00")],
@@ -121,7 +138,7 @@ def main():
             )
         )
 
-        # WHO 與環境部標準線
+        # 參考標準線
         fig.add_hline(
             y=15,
             line_dash="dash",
@@ -145,7 +162,6 @@ def main():
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # **數據表格**
         st.subheader("📋 未來 24 小時預測數值明細")
         df_display = pd.DataFrame(
             {
@@ -155,7 +171,7 @@ def main():
         )
         st.dataframe(df_display.T, use_container_width=True)
     else:
-        st.info("💡 預測完成，請重新整理頁面讀取 SQLite 最新數據。")
+        st.info("💡 預測完成！若數據尚未即時顯示，請點擊左側「🔄 刷新即時監測數據」按鈕。")
 
 
 if __name__ == "__main__":
