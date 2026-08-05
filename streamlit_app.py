@@ -25,7 +25,8 @@ st.set_page_config(
 def main():
     st.title("🌬️ 台中市霧峰區 PM2.5 未來 24 小時預測系統")
     st.caption(
-        "結合大氣氣象、即時環測與國道 3 號車流量之 LSTM 深度學習趨勢預測儀表板"
+        "結合大氣氣象、即時環測與國道 3 號車流量之 LSTM"
+        " 深度學習趨勢預測儀表板"
     )
 
     # 側邊欄控制與資訊
@@ -53,7 +54,9 @@ def main():
     col2.metric("氣溫", f"{live_features_list[1]:.1f} ℃")
     col3.metric("相對濕度", f"{live_features_list[2]:.0f} %")
     col4.metric("風速", f"{live_features_list[3]:.1f} m/s")
-    col5.metric("國道3號車流量 (北上)", f"{int(live_features_list[8])} 輛/時")
+    col5.metric(
+        "國道3號車流量 (北上)", f"{int(live_features_list[8])} 輛/時"
+    )
 
     st.markdown("---")
 
@@ -62,52 +65,51 @@ def main():
 
     model_path = "best_model_ExpC_Cyclic.pth"
     if not os.path.exists(model_path):
-        st.error(f"❌ 找不到模型權重檔 `{model_path}`，請確認檔案已上傳至 GitHub！")
+        st.error(
+            f"❌ 找不到模型權重檔 `{model_path}`，請確認檔案已上傳至 GitHub！"
+        )
         return
 
     # 4. 執行應用主程式與讀取 SQLite 數據
     df_pred = pd.DataFrame()
 
-    with st.spinner("🔮 正在執行 LSTM 滾動推論..."):
+    with st.spinner("🔮 正在執行 application.main() 進行滾動推論..."):
         try:
-            # 呼叫你原本寫好的 main 流程 (含寫入資料庫)
+            # 呼叫你原本寫好的 main 流程 (會自動執行推論並寫入 SQLite)
             application.main()
         except Exception as e:
             st.warning(f"背景主程式執行提示: {e}")
 
-        # 第一優先：從 SQLite 資料庫讀取剛寫入的數據
-        db_file = os.path.join(current_dir, "pm25_data.db")
+        # ✅ 修正一：優先讀取你建立的 pm25_forecast.db
+        db_file = os.path.join(current_dir, "pm25_forecast.db")
+        if not os.path.exists(db_file):
+            db_file = os.path.join(current_dir, "pm25_data.db")
+
         if os.path.exists(db_file):
             try:
                 conn = sqlite3.connect(db_file)
-                query_latest = """
-                    SELECT target_time, predicted_pm25 
-                    FROM predictions 
-                    ORDER BY id DESC LIMIT 24
-                """
-                df_pred = pd.read_sql_query(query_latest, conn)
+
+                # ✅ 修正二：動態支援 pred_pm25 與 predicted_pm25 欄位名
+                try:
+                    query = """
+                        SELECT target_time, pred_pm25 AS predicted_pm25 
+                        FROM predictions 
+                        ORDER BY id DESC LIMIT 24
+                    """
+                    df_pred = pd.read_sql_query(query, conn)
+                except Exception:
+                    query_backup = """
+                        SELECT target_time, predicted_pm25 
+                        FROM predictions 
+                        ORDER BY id DESC LIMIT 24
+                    """
+                    df_pred = pd.read_sql_query(query_backup, conn)
+
                 if not df_pred.empty:
                     df_pred = df_pred.iloc[::-1].reset_index(drop=True)
                 conn.close()
-            except Exception:
-                pass
-
-        # 第二優先 (雙重保險)：若 SQLite 讀取不到，直接呼叫 application 內的預測模組進行計算
-        if df_pred.empty:
-            try:
-                # 直接呼叫 application 的預測函式
-                preds = application.predict_future_24h(live_features_list)
-                future_times = [
-                    (now + datetime.timedelta(hours=i + 1)).strftime(
-                        "%Y-%m-%d %H:00"
-                    )
-                    for i in range(24)
-                ]
-                df_pred = pd.DataFrame(
-                    {"target_time": future_times, "predicted_pm25": preds}
-                )
             except Exception as e:
-                st.error(f"無法產生預測數據，詳細錯誤: {e}")
+                st.error(f"讀取 SQLite 預測數據失敗: {e}")
 
     # 5. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
@@ -172,6 +174,11 @@ def main():
             }
         )
         st.dataframe(df_display.T, use_container_width=True)
+    else:
+        st.error(
+            "⚠️ 無法取得預測數據，請確認 application.main() 是否順利將結果寫入"
+            " SQLite 資料庫。"
+        )
 
 
 if __name__ == "__main__":
