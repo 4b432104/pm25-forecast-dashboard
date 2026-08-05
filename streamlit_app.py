@@ -6,7 +6,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# 引用原本未修改的 application.py 與 db_manager.py
+# **強制鎖定工作目錄**，確保 Streamlit 與 application.py 使用同一個路徑
+current_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(current_dir)
+
+# 引用原本完全未修改的 application.py 與 db_manager.py
 import application
 import db_manager
 
@@ -53,7 +57,7 @@ def main():
 
     st.markdown("---")
 
-    # 3. 觸發模型推論
+    # 3. 檢查模型權重
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
     model_path = "best_model_ExpC_Cyclic.pth"
@@ -61,45 +65,51 @@ def main():
         st.error(f"❌ 找不到模型權重檔 `{model_path}`，請確認檔案已上傳至 GitHub！")
         return
 
-    with st.spinner("🔮 正在執行 LSTM 滾動推論並寫入資料庫..."):
+    # 4. 執行應用主程式與讀取 SQLite 數據
+    df_pred = pd.DataFrame()
+
+    with st.spinner("🔮 正在執行 LSTM 滾動推論..."):
         try:
+            # 呼叫你原本寫好的 main 流程 (含寫入資料庫)
             application.main()
         except Exception as e:
-            st.warning(f"執行應用主程式推論時發生警告: {e}")
+            st.warning(f"背景主程式執行提示: {e}")
 
-    # 4. 讀取預測數據 (多重自動尋找 SQLite 資料庫路徑)
-    df_pred = pd.DataFrame()
-    possible_paths = [
-        "pm25_data.db",
-        os.path.join(os.getcwd(), "pm25_data.db"),
-        "/mount/src/pm25-forecast-dashboard/pm25_data.db",
-    ]
+        # 第一優先：從 SQLite 資料庫讀取剛寫入的數據
+        db_file = os.path.join(current_dir, "pm25_data.db")
+        if os.path.exists(db_file):
+            try:
+                conn = sqlite3.connect(db_file)
+                query_latest = """
+                    SELECT target_time, predicted_pm25 
+                    FROM predictions 
+                    ORDER BY id DESC LIMIT 24
+                """
+                df_pred = pd.read_sql_query(query_latest, conn)
+                if not df_pred.empty:
+                    df_pred = df_pred.iloc[::-1].reset_index(drop=True)
+                conn.close()
+            except Exception:
+                pass
 
-    target_db_path = None
-    for p in possible_paths:
-        if os.path.exists(p):
-            target_db_path = p
-            break
+        # 第二優先 (雙重保險)：若 SQLite 讀取不到，直接呼叫 application 內的預測模組進行計算
+        if df_pred.empty:
+            try:
+                # 直接呼叫 application 的預測函式
+                preds = application.predict_future_24h(live_features_list)
+                future_times = [
+                    (now + datetime.timedelta(hours=i + 1)).strftime(
+                        "%Y-%m-%d %H:00"
+                    )
+                    for i in range(24)
+                ]
+                df_pred = pd.DataFrame(
+                    {"target_time": future_times, "predicted_pm25": preds}
+                )
+            except Exception as e:
+                st.error(f"無法產生預測數據，詳細錯誤: {e}")
 
-    if target_db_path:
-        try:
-            conn = sqlite3.connect(target_db_path)
-            
-            # 【關鍵修復】：直接抓取資料庫內最新寫入的 24 筆預測值，避免 base_time 字串比對不到的問題
-            query_latest = """
-                SELECT target_time, predicted_pm25 
-                FROM predictions 
-                ORDER BY id DESC LIMIT 24
-            """
-            df_pred = pd.read_sql_query(query_latest, conn)
-            if not df_pred.empty:
-                df_pred = df_pred.iloc[::-1].reset_index(drop=True)  # 反轉回按時間正序排列
-
-            conn.close()
-        except Exception as e:
-            st.warning(f"讀取 SQLite 數據時發生錯誤: {e}")
-
-    # 5. 渲染 Plotly 圖表與表格
+    # 5. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
         df_pred["display_time"] = pd.to_datetime(
             df_pred["target_time"]
@@ -162,8 +172,6 @@ def main():
             }
         )
         st.dataframe(df_display.T, use_container_width=True)
-    else:
-        st.error("⚠️ 尚未抓取到預測資料，請確認 application.py 寫入資料庫邏輯是否正常執行。")
 
 
 if __name__ == "__main__":
