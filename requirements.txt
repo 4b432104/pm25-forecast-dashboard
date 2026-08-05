@@ -5,3 +5,5 @@ beautifulsoup4
 requests
 scikit-learn
 numpy
+--find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+torch
