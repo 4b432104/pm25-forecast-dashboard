@@ -1,11 +1,12 @@
 import datetime
 import os
+import sqlite3
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# 1. 直接引用你原本寫好的 application.py 與 db_manager.py
+# 引用你原本完全未修改的 application.py 與 db_manager.py
 import application
 import db_manager
 
@@ -35,7 +36,6 @@ def main():
     # 執行與呼叫原本 application.py 裡面的即時資料抓取
     with st.spinner("📡 正在呼叫爬蟲與模型推論..."):
         try:
-            # 直接呼叫你原本寫好的 fetch_wufeng_live_features 函式
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
@@ -53,7 +53,7 @@ def main():
 
     st.markdown("---")
 
-    # **觸發背景預測與 SQLite 寫入 (直接執行你原本寫好的 main() 邏輯)**
+    # **觸發背景預測與 SQLite 寫入 (直接執行你原本寫好的 application.main)**
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
     # 檢查模型權重是否存在
@@ -67,23 +67,27 @@ def main():
 
     # 執行原本 application.py 的流程來計算預測值並更新資料庫
     with st.spinner("🔮 正在進行 LSTM 滾動推論..."):
-        # 呼叫你原本寫好的 main 流程
         application.main()
 
-    # 從 SQLite 資料庫抓取剛才寫入的最新預測資料來畫圖
-    try:
-        conn = db_manager.get_db_connection()
-        query = """
-            SELECT target_time, predicted_pm25 
-            FROM predictions 
-            WHERE base_time = ? 
-            ORDER BY target_time ASC
-        """
-        df_pred = pd.read_sql_query(query, conn, params=(current_time_str,))
-        conn.close()
-    except Exception as e:
-        st.warning(f"從 SQLite 資料庫讀取預測結果失敗: {e}")
-        df_pred = pd.DataFrame()
+    # **修正處：改用標準 sqlite3 連線讀取 SQLite 資料庫 (pm25_data.db)**
+    df_pred = pd.DataFrame()
+    db_file = "pm25_data.db"
+
+    if os.path.exists(db_file):
+        try:
+            conn = sqlite3.connect(db_file)
+            query = """
+                SELECT target_time, predicted_pm25 
+                FROM predictions 
+                WHERE base_time = ? 
+                ORDER BY target_time ASC
+            """
+            df_pred = pd.read_sql_query(query, conn, params=(current_time_str,))
+            conn.close()
+        except Exception as e:
+            st.warning(f"讀取 SQLite 數據庫時發生提示: {e}")
+    else:
+        st.warning(f"⚠️ 找不到 `{db_file}` 資料庫檔案")
 
     if not df_pred.empty:
         # 整理時間格式
