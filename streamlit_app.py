@@ -84,24 +84,16 @@ def main():
     if target_db_path:
         try:
             conn = sqlite3.connect(target_db_path)
-            # 優先嘗試查詢當前時間，如果無資料則抓取最新的 24 筆預測
-            query = """
+            
+            # 【關鍵修復】：直接抓取資料庫內最新寫入的 24 筆預測值，避免 base_time 字串比對不到的問題
+            query_latest = """
                 SELECT target_time, predicted_pm25 
                 FROM predictions 
-                WHERE base_time = ? 
-                ORDER BY target_time ASC
+                ORDER BY id DESC LIMIT 24
             """
-            df_pred = pd.read_sql_query(query, conn, params=(current_time_str,))
-            
-            # 若剛剛寫入的時間格式有些微落差， fallback 取最新寫入的 24 筆
-            if df_pred.empty:
-                query_fallback = """
-                    SELECT target_time, predicted_pm25 
-                    FROM predictions 
-                    ORDER BY id DESC LIMIT 24
-                """
-                df_pred = pd.read_sql_query(query_fallback, conn)
-                df_pred = df_pred.iloc[::-1]  # 轉回正序
+            df_pred = pd.read_sql_query(query_latest, conn)
+            if not df_pred.empty:
+                df_pred = df_pred.iloc[::-1].reset_index(drop=True)  # 反轉回按時間正序排列
 
             conn.close()
         except Exception as e:
@@ -171,7 +163,7 @@ def main():
         )
         st.dataframe(df_display.T, use_container_width=True)
     else:
-        st.info("💡 預測完成！若數據尚未即時顯示，請點擊左側「🔄 刷新即時監測數據」按鈕。")
+        st.error("⚠️ 尚未抓取到預測資料，請確認 application.py 寫入資料庫邏輯是否正常執行。")
 
 
 if __name__ == "__main__":
