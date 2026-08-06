@@ -35,32 +35,20 @@ def main():
     if st.sidebar.button("🔄 刷新即時監測數據"):
         st.rerun()
 
-    # 1. 處理時區與抓取資料庫最新 base_time
+    # 1. 處理當前時間 (鎖定台灣時區)
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
-    current_time_str = now.strftime("%Y-%m-%d %H:00")
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
+
+    # 💡 【修正 1】側邊欄直接顯示當前真實基準時間
+    st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
 
     db_file = os.path.join(current_dir, "pm25_forecast.db")
     if not os.path.exists(db_file):
         db_file = os.path.join(current_dir, "pm25_data.db")
 
-    latest_base_time = current_time_str  # 預設備援值
-    if os.path.exists(db_file):
-        try:
-            conn = sqlite3.connect(db_file)
-            cursor = conn.cursor()
-            cursor.execute("SELECT MAX(base_time) FROM predictions")
-            row = cursor.fetchone()
-            if row and row[0]:
-                latest_base_time = row[0]
-            conn.close()
-        except Exception:
-            pass
-
-    # 側邊欄顯示背景排程器實際產生的最新基準時間
-    st.sidebar.write(f"🕒 **當前基準時間**: {latest_base_time}")
-
-    # 2. 抓取即時資料 (防護機制：失敗或 API 卡死時跳備援，避免網頁卡住)
+    # 2. 抓取即時資料 (防護機制： API 卡死時自動進入備援模式)
     live_features_list = [0.0] * 14
     with st.spinner("📡 正在擷取霧峰即時監測數據..."):
         try:
@@ -97,33 +85,28 @@ def main():
         )
         return
 
-    # 5. 讀取 SQLite 最新預測數據
+    # 5. 讀取 SQLite 預測數據
     df_pred = pd.DataFrame()
 
     if os.path.exists(db_file):
         try:
             conn = sqlite3.connect(db_file)
 
-            # 抓取工作排程器最新寫入的那一整組 24h 預測
+            # 💡 【修正 2】移除 LIMIT 24 限制，把相關資料全拿出來，交給 Python 來過濾未來的 24 小時
             query = """
                 SELECT target_time, pred_pm25 AS predicted_pm25, step
                 FROM predictions
-                WHERE base_time = (SELECT MAX(base_time) FROM predictions)
-                ORDER BY step ASC
-                LIMIT 24
+                ORDER BY id DESC LIMIT 100
             """
             try:
                 df_pred = pd.read_sql_query(query, conn)
             except Exception:
-                # 備援查詢 (針對舊格式資料表)
                 query_backup = """
                     SELECT target_time, predicted_pm25 
                     FROM predictions 
-                    ORDER BY id DESC LIMIT 24
+                    ORDER BY id DESC LIMIT 100
                 """
                 df_pred = pd.read_sql_query(query_backup, conn)
-                if not df_pred.empty:
-                    df_pred = df_pred.iloc[::-1].reset_index(drop=True)
 
             conn.close()
         except Exception as e:
@@ -137,20 +120,20 @@ def main():
             by="target_datetime", ascending=True
         ).drop_duplicates(subset=["target_datetime"]).reset_index(drop=True)
 
-        # 2) 取得當前整點並移除時區資訊 (避免 datetime 與 timestamp 比對錯誤)
-        current_hour = now.replace(minute=0, second=0, microsecond=0)
+        # 2) 取得當前整點 (移除時區以利比對)
         current_hour_naive = current_hour.replace(tzinfo=None)
 
-        # 3) 只保留大於「當前整點」的未來預測點
+        # 3) 💡 【關鍵修正】過濾掉已經發生的時間點，並精準保留未來的「完整 24 個預測點」
         df_pred_future = df_pred[df_pred["target_datetime"] > current_hour_naive].copy()
 
-        # 如果過濾後還有數據，則採用過濾後的數據；否則使用原數據避免畫面空白
         if not df_pred_future.empty:
-            df_pred = df_pred_future.reset_index(drop=True)
+            df_pred = df_pred_future.head(24).reset_index(drop=True)
+        else:
+            df_pred = df_pred.tail(24).reset_index(drop=True)
 
         fig = go.Figure()
 
-        # 當前實測點 (紅點：標記在當前整點)
+        # 當前實測點 (紅點)
         fig.add_trace(
             go.Scatter(
                 x=[current_hour_naive],
@@ -161,7 +144,7 @@ def main():
             )
         )
 
-        # 預測折線 (藍線：從下一個小時延伸至未來 24h)
+        # 預測折線 (藍線：完整的 24 小時預測)
         fig.add_trace(
             go.Scatter(
                 x=df_pred["target_datetime"],
@@ -187,7 +170,7 @@ def main():
             annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
         )
 
-        # 強制設定 Plotly X 軸為時間軸與顯示格式
+        # 設定 Plotly X 軸
         fig.update_layout(
             xaxis=dict(
                 title="預測時間點",
@@ -202,7 +185,7 @@ def main():
 
         st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("📋 未來預測數值明細")
+        st.subheader("📋 未來 24 小時預測數值明細")
         df_display = pd.DataFrame(
             {
                 "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
