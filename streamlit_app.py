@@ -11,7 +11,7 @@ import streamlit as st
 current_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(current_dir)
 
-# 引用原本完全未修改的 application.py 與 db_manager.py
+# 引用原本未修改的 application.py 與 db_manager.py
 import application
 import db_manager
 
@@ -35,7 +35,7 @@ def main():
     if st.sidebar.button("🔄 刷新即時監測數據"):
         st.rerun()
 
-    # 💡 1. 處理時區與抓取資料庫最新 base_time
+    # 1. 處理時區與抓取資料庫最新 base_time
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
     current_time_str = now.strftime("%Y-%m-%d %H:00")
@@ -57,7 +57,7 @@ def main():
         except Exception:
             pass
 
-    # 側邊欄精準顯示背景排程器最新產生的基準時間
+    # 側邊欄顯示排程器實際產生的最新基準時間
     st.sidebar.write(f"🕒 **當前基準時間**: {latest_base_time}")
 
     # 2. 抓取即時資料 (用於頂部 Metric 卡片與圖表當前實測點)
@@ -92,14 +92,14 @@ def main():
         )
         return
 
-    # 5. 讀取 SQLite 最新預測數據 (由背景工作排程器自動更新，網頁不重複觸發推論)
+    # 5. 讀取 SQLite 最新預測數據 (由背景排程器自動更新)
     df_pred = pd.DataFrame()
 
     if os.path.exists(db_file):
         try:
             conn = sqlite3.connect(db_file)
 
-            # 抓取工作排程器最新寫入的那一整組 24h 預測 (以最新 base_time 為準)
+            # 抓取工作排程器最新寫入的那一整組 24h 預測
             query = """
                 SELECT target_time, pred_pm25 AS predicted_pm25, step
                 FROM predictions
@@ -125,25 +125,19 @@ def main():
             st.error(f"讀取 SQLite 預測數據失敗: {e}")
 
     # 6. 繪製 Plotly 圖表與表格
-    # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
-        # 💡 【關鍵修復】強制依照 target_time 時間進行正向排序，避免 X 軸倒退與交叉
-        df_pred["target_time"] = pd.to_datetime(df_pred["target_time"])
+        # 強制轉換為標準 Datetime 並正向排序與去重
+        df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
         df_pred = df_pred.sort_values(
-            by="target_time", ascending=True
-        ).reset_index(drop=True)
-
-        # 格式化顯示時間
-        df_pred["display_time"] = df_pred["target_time"].dt.strftime(
-            "%m/%d %H:00"
-        )
+            by="target_datetime", ascending=True
+        ).drop_duplicates(subset=["target_datetime"]).reset_index(drop=True)
 
         fig = go.Figure()
 
         # 當前實測點 (紅點)
         fig.add_trace(
             go.Scatter(
-                x=[now.strftime("%m/%d %H:00")],
+                x=[now.replace(minute=0, second=0, microsecond=0)],
                 y=[live_features_list[7]],
                 mode="markers",
                 name="當前實測值",
@@ -151,10 +145,10 @@ def main():
             )
         )
 
-        # 預測折線 (藍線)
+        # 預測折線 (藍線) - X 軸採用真實 Datetime 物件
         fig.add_trace(
             go.Scatter(
-                x=df_pred["display_time"],
+                x=df_pred["target_datetime"],
                 y=df_pred["predicted_pm25"],
                 mode="lines+markers",
                 name="LSTM 預測 PM2.5 (µg/m³)",
@@ -177,8 +171,13 @@ def main():
             annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
         )
 
+        # 強制設定 Plotly X 軸為時間軸與顯示格式
         fig.update_layout(
-            xaxis_title="預測時間點",
+            xaxis=dict(
+                title="預測時間點",
+                type="date",
+                tickformat="%m/%d %H:00",
+            ),
             yaxis_title="PM2.5 濃度 (µg/m³)",
             hovermode="x unified",
             margin=dict(l=20, r=20, t=30, b=20),
@@ -190,7 +189,7 @@ def main():
         st.subheader("📋 未來 24 小時預測數值明細")
         df_display = pd.DataFrame(
             {
-                "預測時間點": df_pred["display_time"],
+                "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
                 "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
             }
         )
