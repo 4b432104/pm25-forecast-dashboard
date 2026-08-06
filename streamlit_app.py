@@ -125,14 +125,22 @@ def main():
             st.error(f"讀取 SQLite 預測數據失敗: {e}")
 
     # 6. 繪製 Plotly 圖表與表格
+    # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
-        df_pred["display_time"] = pd.to_datetime(
-            df_pred["target_time"]
-        ).dt.strftime("%m/%d %H:00")
+        # 💡 【關鍵修復】強制依照 target_time 時間進行正向排序，避免 X 軸倒退與交叉
+        df_pred["target_time"] = pd.to_datetime(df_pred["target_time"])
+        df_pred = df_pred.sort_values(
+            by="target_time", ascending=True
+        ).reset_index(drop=True)
+
+        # 格式化顯示時間
+        df_pred["display_time"] = df_pred["target_time"].dt.strftime(
+            "%m/%d %H:00"
+        )
 
         fig = go.Figure()
 
-        # 當前實測點
+        # 當前實測點 (紅點)
         fig.add_trace(
             go.Scatter(
                 x=[now.strftime("%m/%d %H:00")],
@@ -143,7 +151,7 @@ def main():
             )
         )
 
-        # 預測折線
+        # 預測折線 (藍線)
         fig.add_trace(
             go.Scatter(
                 x=df_pred["display_time"],
