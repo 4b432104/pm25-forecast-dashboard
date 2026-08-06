@@ -7,15 +7,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# **強制鎖定工作目錄**，確保 Streamlit 與 application.py 使用同一個路徑
+# **強制鎖定工作目錄**，確保 Streamlit 與本地模組使用同一個相對路徑
 current_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(current_dir)
 
-# 引用原本未修改的 application.py 與 db_manager.py
+# 引用 application.py 與 db_manager.py
 import application
 import db_manager
 
-# 設定 Streamlit 網頁標題與寬度
+# 設定 Streamlit 網頁標題與頁面配置
 st.set_page_config(
     page_title="台中霧峰 PM2.5 未來 24 小時預測系統",
     layout="wide",
@@ -57,23 +57,22 @@ def main():
         except Exception:
             pass
 
-    # 側邊欄顯示排程器實際產生的最新基準時間
+    # 側邊欄顯示背景排程器實際產生的最新基準時間
     st.sidebar.write(f"🕒 **當前基準時間**: {latest_base_time}")
 
-    # 2. 抓取即時資料 (加上 Exception 捕捉與預設備援，避免 API 卡死網頁)
-    live_features_list = [0.0] * 14  # 預先準備 14 個 0 的備援清單
+    # 2. 抓取即時資料 (防護機制：失敗或 API 卡死時跳備援，避免網頁卡住)
+    live_features_list = [0.0] * 14
     with st.spinner("📡 正在擷取霧峰即時監測數據..."):
         try:
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
             st.warning(f"⚠️ 即時數據 API 暫時無回應，已切換至備援狀態: {e}")
-            # 如果爬蟲失敗，填入合理的備援數值 (避免指標卡片顯示 0)
             live_features_list[1] = 28.0  # 氣溫
             live_features_list[2] = 75.0  # 濕度
             live_features_list[3] = 1.5   # 風速
             live_features_list[7] = 12.0  # PM2.5
-            live_features_list[8] = 1200  # 車流量  
+            live_features_list[8] = 1200  # 車流量
 
     # 3. 頂部即時指標卡片
     st.subheader("📊 即時監測數據 Summary")
@@ -98,7 +97,7 @@ def main():
         )
         return
 
-    # 5. 讀取 SQLite 最新預測數據 (由背景排程器自動更新)
+    # 5. 讀取 SQLite 最新預測數據
     df_pred = pd.DataFrame()
 
     if os.path.exists(db_file):
@@ -130,33 +129,28 @@ def main():
         except Exception as e:
             st.error(f"讀取 SQLite 預測數據失敗: {e}")
 
-   # 6. 繪製 Plotly 圖表與表格
+    # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
-        # 1. 強制轉換為標準 Datetime 並正向排序與去重
+        # 1) 強制轉換為標準 Datetime 並正向排序與去重
         df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
         df_pred = df_pred.sort_values(
             by="target_datetime", ascending=True
         ).drop_duplicates(subset=["target_datetime"]).reset_index(drop=True)
 
-        # 💡 【核心新增】只保留 target_datetime 大於「當前整點時間」的最新預測點
+        # 2) 取得當前整點並移除時區資訊 (避免 datetime 與 timestamp 比對錯誤)
         current_hour = now.replace(minute=0, second=0, microsecond=0)
-        
-        # 移除時區資訊以確保 Datetime 比對無誤
-        if current_hour.tzinfo is not None:
-            current_hour_naive = current_hour.tzlocalize(None)
-        else:
-            current_hour_naive = current_hour
+        current_hour_naive = current_hour.replace(tzinfo=None)
 
-        # 過濾掉過去已經發生的時間點
+        # 3) 只保留大於「當前整點」的未來預測點
         df_pred_future = df_pred[df_pred["target_datetime"] > current_hour_naive].copy()
 
-        # 如果過濾後還有資料就用過濾後的，避免完全沒資料可呈現
+        # 如果過濾後還有數據，則採用過濾後的數據；否則使用原數據避免畫面空白
         if not df_pred_future.empty:
             df_pred = df_pred_future.reset_index(drop=True)
 
         fig = go.Figure()
 
-        # 當前實測點 (紅點：位於當前整點)
+        # 當前實測點 (紅點：標記在當前整點)
         fig.add_trace(
             go.Scatter(
                 x=[current_hour_naive],
@@ -167,7 +161,7 @@ def main():
             )
         )
 
-        # 預測折線 (藍線：從最新的下一個小時開始延伸)
+        # 預測折線 (藍線：從下一個小時延伸至未來 24h)
         fig.add_trace(
             go.Scatter(
                 x=df_pred["target_datetime"],
@@ -193,7 +187,7 @@ def main():
             annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
         )
 
-        # 設定 Plotly X 軸
+        # 強制設定 Plotly X 軸為時間軸與顯示格式
         fig.update_layout(
             xaxis=dict(
                 title="預測時間點",
