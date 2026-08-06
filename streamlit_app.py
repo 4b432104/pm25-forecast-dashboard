@@ -60,14 +60,20 @@ def main():
     # 側邊欄顯示排程器實際產生的最新基準時間
     st.sidebar.write(f"🕒 **當前基準時間**: {latest_base_time}")
 
-    # 2. 抓取即時資料 (用於頂部 Metric 卡片與圖表當前實測點)
+    # 2. 抓取即時資料 (加上 Exception 捕捉與預設備援，避免 API 卡死網頁)
+    live_features_list = [0.0] * 14  # 預先準備 14 個 0 的備援清單
     with st.spinner("📡 正在擷取霧峰即時監測數據..."):
         try:
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
-            st.error(f"擷取即時特徵時發生錯誤: {e}")
-            return
+            st.warning(f"⚠️ 即時數據 API 暫時無回應，已切換至備援狀態: {e}")
+            # 如果爬蟲失敗，填入合理的備援數值 (避免指標卡片顯示 0)
+            live_features_list[1] = 28.0  # 氣溫
+            live_features_list[2] = 75.0  # 濕度
+            live_features_list[3] = 1.5   # 風速
+            live_features_list[7] = 12.0  # PM2.5
+            live_features_list[8] = 1200  # 車流量
 
     # 3. 頂部即時指標卡片
     st.subheader("📊 即時監測數據 Summary")
