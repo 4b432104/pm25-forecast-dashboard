@@ -71,48 +71,46 @@ def main():
         return
 
     # 4. 執行應用主程式與讀取 SQLite 數據
+    # 4. 讀取 SQLite 最新預測數據 (由背景排程器自動更新)
     df_pred = pd.DataFrame()
 
-    with st.spinner("🔮 正在執行 application.main() 進行滾動推論..."):
+    # 💡 註解或移除 application.main()，讓網頁只專心讀取資料庫
+    # try:
+    #     application.main()
+    # except Exception as e:
+    #     st.warning(f"背景主程式執行提示: {e}")
+
+    db_file = os.path.join(current_dir, "pm25_forecast.db")
+    if not os.path.exists(db_file):
+        db_file = os.path.join(current_dir, "pm25_data.db")
+
+    if os.path.exists(db_file):
         try:
-            # 呼叫你原本寫好的 main 流程
-            application.main()
-        except Exception as e:
-            st.warning(f"背景主程式執行提示: {e}")
+            conn = sqlite3.connect(db_file)
 
-        # 優先讀取 pm25_forecast.db
-        db_file = os.path.join(current_dir, "pm25_forecast.db")
-        if not os.path.exists(db_file):
-            db_file = os.path.join(current_dir, "pm25_data.db")
-
-        if os.path.exists(db_file):
+            # 抓取工作排程器最新寫入的那一整組 24h 預測
+            query = """
+                SELECT target_time, pred_pm25 AS predicted_pm25, step
+                FROM predictions
+                WHERE base_time = (SELECT MAX(base_time) FROM predictions)
+                ORDER BY step ASC
+                LIMIT 24
+            """
             try:
-                conn = sqlite3.connect(db_file)
-
-                # 💡 精準查詢：先找出「最新一次推論」的 base_time，再抓出該批次的 24 筆預測
-                query = """
-                    SELECT target_time, pred_pm25 AS predicted_pm25, step
-                    FROM predictions
-                    WHERE base_time = (SELECT MAX(base_time) FROM predictions)
-                    ORDER BY step ASC
-                    LIMIT 24
+                df_pred = pd.read_sql_query(query, conn)
+            except Exception:
+                query_backup = """
+                    SELECT target_time, predicted_pm25 
+                    FROM predictions 
+                    ORDER BY id DESC LIMIT 24
                 """
-                try:
-                    df_pred = pd.read_sql_query(query, conn)
-                except Exception:
-                    # 備援：若舊表沒有 step 或 base_time，退回按 id 排序
-                    query_backup = """
-                        SELECT target_time, predicted_pm25 
-                        FROM predictions 
-                        ORDER BY id DESC LIMIT 24
-                    """
-                    df_pred = pd.read_sql_query(query_backup, conn)
-                    if not df_pred.empty:
-                        df_pred = df_pred.iloc[::-1].reset_index(drop=True)
+                df_pred = pd.read_sql_query(query_backup, conn)
+                if not df_pred.empty:
+                    df_pred = df_pred.iloc[::-1].reset_index(drop=True)
 
-                conn.close()
-            except Exception as e:
-                st.error(f"讀取 SQLite 預測數據失敗: {e}")
+            conn.close()
+        except Exception as e:
+            st.error(f"讀取 SQLite 預測數據失敗: {e}")
     # 5. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
         df_pred["display_time"] = pd.to_datetime(
