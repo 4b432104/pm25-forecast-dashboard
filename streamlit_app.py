@@ -73,7 +73,7 @@ def main():
             live_features_list[2] = 75.0  # 濕度
             live_features_list[3] = 1.5   # 風速
             live_features_list[7] = 12.0  # PM2.5
-            live_features_list[8] = 1200  # 車流量
+            live_features_list[8] = 1200  # 車流量  
 
     # 3. 頂部即時指標卡片
     st.subheader("📊 即時監測數據 Summary")
@@ -130,20 +130,36 @@ def main():
         except Exception as e:
             st.error(f"讀取 SQLite 預測數據失敗: {e}")
 
-    # 6. 繪製 Plotly 圖表與表格
+   # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
-        # 強制轉換為標準 Datetime 並正向排序與去重
+        # 1. 強制轉換為標準 Datetime 並正向排序與去重
         df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
         df_pred = df_pred.sort_values(
             by="target_datetime", ascending=True
         ).drop_duplicates(subset=["target_datetime"]).reset_index(drop=True)
 
+        # 💡 【核心新增】只保留 target_datetime 大於「當前整點時間」的最新預測點
+        current_hour = now.replace(minute=0, second=0, microsecond=0)
+        
+        # 移除時區資訊以確保 Datetime 比對無誤
+        if current_hour.tzinfo is not None:
+            current_hour_naive = current_hour.tzlocalize(None)
+        else:
+            current_hour_naive = current_hour
+
+        # 過濾掉過去已經發生的時間點
+        df_pred_future = df_pred[df_pred["target_datetime"] > current_hour_naive].copy()
+
+        # 如果過濾後還有資料就用過濾後的，避免完全沒資料可呈現
+        if not df_pred_future.empty:
+            df_pred = df_pred_future.reset_index(drop=True)
+
         fig = go.Figure()
 
-        # 當前實測點 (紅點)
+        # 當前實測點 (紅點：位於當前整點)
         fig.add_trace(
             go.Scatter(
-                x=[now.replace(minute=0, second=0, microsecond=0)],
+                x=[current_hour_naive],
                 y=[live_features_list[7]],
                 mode="markers",
                 name="當前實測值",
@@ -151,7 +167,7 @@ def main():
             )
         )
 
-        # 預測折線 (藍線) - X 軸採用真實 Datetime 物件
+        # 預測折線 (藍線：從最新的下一個小時開始延伸)
         fig.add_trace(
             go.Scatter(
                 x=df_pred["target_datetime"],
@@ -177,7 +193,7 @@ def main():
             annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
         )
 
-        # 強制設定 Plotly X 軸為時間軸與顯示格式
+        # 設定 Plotly X 軸
         fig.update_layout(
             xaxis=dict(
                 title="預測時間點",
@@ -192,7 +208,7 @@ def main():
 
         st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("📋 未來 24 小時預測數值明細")
+        st.subheader("📋 未來預測數值明細")
         df_display = pd.DataFrame(
             {
                 "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
