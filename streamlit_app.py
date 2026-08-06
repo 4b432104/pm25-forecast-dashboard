@@ -1,6 +1,7 @@
 import datetime
 import os
 import sqlite3
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -34,11 +35,32 @@ def main():
     if st.sidebar.button("🔄 刷新即時監測數據"):
         st.rerun()
 
-    now = datetime.datetime.now()
+    # 💡 1. 處理時區與抓取資料庫最新 base_time
+    taipei_tz = ZoneInfo("Asia/Taipei")
+    now = datetime.datetime.now(taipei_tz)
     current_time_str = now.strftime("%Y-%m-%d %H:00")
-    st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
 
-    # 1. 抓取即時資料
+    db_file = os.path.join(current_dir, "pm25_forecast.db")
+    if not os.path.exists(db_file):
+        db_file = os.path.join(current_dir, "pm25_data.db")
+
+    latest_base_time = current_time_str  # 預設備援值
+    if os.path.exists(db_file):
+        try:
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            cursor.execute("SELECT MAX(base_time) FROM predictions")
+            row = cursor.fetchone()
+            if row and row[0]:
+                latest_base_time = row[0]
+            conn.close()
+        except Exception:
+            pass
+
+    # 側邊欄精準顯示背景排程器最新產生的基準時間
+    st.sidebar.write(f"🕒 **當前基準時間**: {latest_base_time}")
+
+    # 2. 抓取即時資料 (用於頂部 Metric 卡片與圖表當前實測點)
     with st.spinner("📡 正在擷取霧峰即時監測數據..."):
         try:
             live_features = application.fetch_wufeng_live_features()
@@ -47,7 +69,7 @@ def main():
             st.error(f"擷取即時特徵時發生錯誤: {e}")
             return
 
-    # 2. 頂部即時指標卡片
+    # 3. 頂部即時指標卡片
     st.subheader("📊 即時監測數據 Summary")
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("即時 PM2.5", f"{live_features_list[7]:.1f} µg/m³")
@@ -60,7 +82,7 @@ def main():
 
     st.markdown("---")
 
-    # 3. 檢查模型權重
+    # 4. 檢查模型權重
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
     model_path = "best_model_ExpC_Cyclic.pth"
@@ -70,25 +92,14 @@ def main():
         )
         return
 
-    # 4. 執行應用主程式與讀取 SQLite 數據
-    # 4. 讀取 SQLite 最新預測數據 (由背景排程器自動更新)
+    # 5. 讀取 SQLite 最新預測數據 (由背景工作排程器自動更新，網頁不重複觸發推論)
     df_pred = pd.DataFrame()
-
-    # 💡 註解或移除 application.main()，讓網頁只專心讀取資料庫
-    # try:
-    #     application.main()
-    # except Exception as e:
-    #     st.warning(f"背景主程式執行提示: {e}")
-
-    db_file = os.path.join(current_dir, "pm25_forecast.db")
-    if not os.path.exists(db_file):
-        db_file = os.path.join(current_dir, "pm25_data.db")
 
     if os.path.exists(db_file):
         try:
             conn = sqlite3.connect(db_file)
 
-            # 抓取工作排程器最新寫入的那一整組 24h 預測
+            # 抓取工作排程器最新寫入的那一整組 24h 預測 (以最新 base_time 為準)
             query = """
                 SELECT target_time, pred_pm25 AS predicted_pm25, step
                 FROM predictions
@@ -99,6 +110,7 @@ def main():
             try:
                 df_pred = pd.read_sql_query(query, conn)
             except Exception:
+                # 備援查詢 (針對舊格式資料表)
                 query_backup = """
                     SELECT target_time, predicted_pm25 
                     FROM predictions 
@@ -111,7 +123,8 @@ def main():
             conn.close()
         except Exception as e:
             st.error(f"讀取 SQLite 預測數據失敗: {e}")
-    # 5. 繪製 Plotly 圖表與表格
+
+    # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
         df_pred["display_time"] = pd.to_datetime(
             df_pred["target_time"]
@@ -176,7 +189,7 @@ def main():
         st.dataframe(df_display.T, use_container_width=True)
     else:
         st.error(
-            "⚠️ 無法取得預測數據，請確認 application.main() 是否順利將結果寫入"
+            "⚠️ 無法取得預測數據，請確認背景工作排程器是否已順利將結果寫入"
             " SQLite 資料庫。"
         )
 
