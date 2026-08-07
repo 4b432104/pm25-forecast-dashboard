@@ -41,14 +41,28 @@ def main():
     current_hour = now.replace(minute=0, second=0, microsecond=0)
     current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
 
-    # 💡 【修正 1】側邊欄直接顯示當前真實基準時間
-    st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
-
     db_file = os.path.join(current_dir, "pm25_forecast.db")
     if not os.path.exists(db_file):
         db_file = os.path.join(current_dir, "pm25_data.db")
 
-    # 2. 抓取即時資料 (防護機制： API 卡死時自動進入備援模式)
+    # 2. 從資料庫獲取排程器真正寫入的最新 base_time
+    latest_base_time = current_time_str
+    if os.path.exists(db_file):
+        try:
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+            cursor.execute("SELECT MAX(base_time) FROM predictions")
+            row = cursor.fetchone()
+            if row and row[0]:
+                latest_base_time = row[0]
+            conn.close()
+        except Exception:
+            pass
+
+    # 側邊欄顯示排程器最後更新時間
+    st.sidebar.write(f"🕒 **當前基準時間**: {latest_base_time}")
+
+    # 3. 抓取即時資料 (防護機制： API 卡死時自動進入備援模式)
     live_features_list = [0.0] * 14
     with st.spinner("📡 正在擷取霧峰即時監測數據..."):
         try:
@@ -62,7 +76,7 @@ def main():
             live_features_list[7] = 12.0  # PM2.5
             live_features_list[8] = 1200  # 車流量
 
-    # 3. 頂部即時指標卡片
+    # 4. 頂部即時指標卡片
     st.subheader("📊 即時監測數據 Summary")
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("即時 PM2.5", f"{live_features_list[7]:.1f} µg/m³")
@@ -75,7 +89,7 @@ def main():
 
     st.markdown("---")
 
-    # 4. 檢查模型權重
+    # 5. 檢查模型權重
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
     model_path = "best_model_ExpC_Cyclic.pth"
@@ -85,55 +99,51 @@ def main():
         )
         return
 
-    # 5. 讀取 SQLite 預測數據
+    # 6. 讀取 SQLite 最新一批預測數據 (💡 精準鎖定 MAX base_time)
     df_pred = pd.DataFrame()
 
     if os.path.exists(db_file):
         try:
             conn = sqlite3.connect(db_file)
 
-            # 💡 【修正 2】移除 LIMIT 24 限制，把相關資料全拿出來，交給 Python 來過濾未來的 24 小時
+            # 💡 【終極修正 SQL】只拿「最新一次基準時間 (MAX base_time)」產生的 24 小時預測，按 step 正序排
             query = """
                 SELECT target_time, pred_pm25 AS predicted_pm25, step
                 FROM predictions
-                ORDER BY id DESC LIMIT 100
+                WHERE base_time = (SELECT MAX(base_time) FROM predictions)
+                ORDER BY step ASC
+                LIMIT 24
             """
             try:
                 df_pred = pd.read_sql_query(query, conn)
             except Exception:
+                # 備援查詢 (若無 step/base_time 欄位)
                 query_backup = """
                     SELECT target_time, predicted_pm25 
                     FROM predictions 
-                    ORDER BY id DESC LIMIT 100
+                    ORDER BY id DESC LIMIT 24
                 """
                 df_pred = pd.read_sql_query(query_backup, conn)
+                if not df_pred.empty:
+                    df_pred = df_pred.iloc[::-1].reset_index(drop=True)
 
             conn.close()
         except Exception as e:
             st.error(f"讀取 SQLite 預測數據失敗: {e}")
 
-    # 6. 繪製 Plotly 圖表與表格
+    # 7. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
-        # 1) 強制轉換為標準 Datetime 並正向排序與去重
+        # 強制轉換為標準 Datetime 並排序
         df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
         df_pred = df_pred.sort_values(
             by="target_datetime", ascending=True
         ).drop_duplicates(subset=["target_datetime"]).reset_index(drop=True)
 
-        # 2) 取得當前整點 (移除時區以利比對)
         current_hour_naive = current_hour.replace(tzinfo=None)
-
-        # 3) 💡 【關鍵修正】過濾掉已經發生的時間點，並精準保留未來的「完整 24 個預測點」
-        df_pred_future = df_pred[df_pred["target_datetime"] > current_hour_naive].copy()
-
-        if not df_pred_future.empty:
-            df_pred = df_pred_future.head(24).reset_index(drop=True)
-        else:
-            df_pred = df_pred.tail(24).reset_index(drop=True)
 
         fig = go.Figure()
 
-        # 當前實測點 (紅點)
+        # 當前實測點 (紅點：位於當前整點)
         fig.add_trace(
             go.Scatter(
                 x=[current_hour_naive],
@@ -144,7 +154,7 @@ def main():
             )
         )
 
-        # 預測折線 (藍線：完整的 24 小時預測)
+        # 預測折線 (藍線：最新一批 24 小時預測)
         fig.add_trace(
             go.Scatter(
                 x=df_pred["target_datetime"],
@@ -170,7 +180,7 @@ def main():
             annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
         )
 
-        # 設定 Plotly X 軸
+        # 設定 Plotly X 軸為時間軸
         fig.update_layout(
             xaxis=dict(
                 title="預測時間點",
