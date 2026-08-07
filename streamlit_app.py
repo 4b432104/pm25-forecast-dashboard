@@ -35,13 +35,13 @@ def main():
     if st.sidebar.button("🔄 刷新即時監測數據"):
         st.rerun()
 
-    # 1. 處理當前時間 (精準鎖定台灣時間 Today)
+    # 1. 處理當前時間 (鎖定台灣時間 Today)
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
     current_hour = now.replace(minute=0, second=0, microsecond=0)
     current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
 
-    # 💡 側邊欄直接顯示當前真正的日期與小時 (例如 2026-08-07 11:00)
+    # 側邊欄顯示當前的基準時間
     st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
 
     db_file = os.path.join(current_dir, "pm25_forecast.db")
@@ -85,7 +85,7 @@ def main():
         )
         return
 
-    # 5. 讀取 SQLite 最新預測數據
+    # 5. 讀取 SQLite 最新預測數據，並檢查是否需要「即時重新預測」
     df_pred = pd.DataFrame()
 
     if os.path.exists(db_file):
@@ -114,9 +114,37 @@ def main():
         except Exception as e:
             st.error(f"讀取 SQLite 預測數據失敗: {e}")
 
+    # 💡 【核心新增】如果資料庫資料過期（預測時間全在過去），則觸發即時模型推論產生「未來 24 小時」！
+    need_live_predict = False
+    if df_pred.empty:
+        need_live_predict = True
+    else:
+        df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
+        # 如果預測結果的最後一個點比當前整點還小或相等，表示資料庫資料已過期
+        if df_pred["target_datetime"].max() <= current_hour.replace(tzinfo=None):
+            need_live_predict = True
+
+    if need_live_predict:
+        try:
+            # 呼叫 application.py 直接進行實時預測
+            preds = application.predict_future_24h(live_features_list)
+            
+            # 建立以當前整點為基準、往後推 24 小時的時間軸
+            future_times = [
+                (current_hour + datetime.timedelta(hours=i + 1)).strftime("%Y-%m-%d %H:00")
+                for i in range(24)
+            ]
+            
+            df_pred = pd.DataFrame({
+                "target_time": future_times,
+                "predicted_pm25": preds
+            })
+            df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
+        except Exception as e:
+            st.warning(f"⚠️ 即時推論預測失敗，顯示最新可用的歷史紀錄: {e}")
+
     # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
-        df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
         df_pred = df_pred.sort_values(
             by="target_datetime", ascending=True
         ).drop_duplicates(subset=["target_datetime"]).reset_index(drop=True)
@@ -125,18 +153,18 @@ def main():
 
         fig = go.Figure()
 
-        # 當前實測點 (紅點：位於當前整點)
+        # 當前實測點 (紅點：位於最左側基準時間點)
         fig.add_trace(
             go.Scatter(
                 x=[current_hour_naive],
                 y=[live_features_list[7]],
                 mode="markers",
-                name="當前實測值",
+                name="當前實測值 (基準時間)",
                 marker=dict(color="red", size=12),
             )
         )
 
-        # 預測折線
+        # 預測折線 (藍線：從基準時間的下一個小時開始往右延伸 24 小時)
         fig.add_trace(
             go.Scatter(
                 x=df_pred["target_datetime"],
@@ -162,7 +190,7 @@ def main():
             annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
         )
 
-        # 設定 Plotly X 軸為時間軸
+        # 設定 Plotly X 軸
         fig.update_layout(
             xaxis=dict(
                 title="預測時間點",
