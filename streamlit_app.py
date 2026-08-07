@@ -35,15 +35,16 @@ def main():
     if st.sidebar.button("🔄 刷新即時監測數據"):
         st.rerun()
 
-    # 1. 處理當前時間 (鎖定台灣時區)
+   # 1. 處理當前時間 (鎖定台灣時區)
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
     current_hour = now.replace(minute=0, second=0, microsecond=0)
+    
+    # 強制格式化為當前的真實日期時間 (例如 2026-08-07 11:00)
     current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
 
-    db_file = os.path.join(current_dir, "pm25_forecast.db")
-    if not os.path.exists(db_file):
-        db_file = os.path.join(current_dir, "pm25_data.db")
+    # 💡 直接顯示當前的真實時間，不再拿舊資料庫的歷史日期來蓋掉今天
+    st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
 
     # 2. 從資料庫獲取排程器真正寫入的最新 base_time
     latest_base_time = current_time_str
