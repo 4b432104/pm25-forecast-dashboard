@@ -23,6 +23,8 @@ st.set_page_config(
 )
 
 
+@st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
+
 def dynamic_predict_24h(current_hour, live_features_list):
     """根據當前動態基準時間與即時特徵，使用 LSTM 模型直接推論未來 24 小時數值"""
     feature_cols = [
