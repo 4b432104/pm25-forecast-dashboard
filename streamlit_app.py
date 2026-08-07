@@ -49,7 +49,7 @@ def dynamic_predict_24h(current_hour, live_features_list):
     sin_idx = feature_cols.index("sin_hour")
     cos_idx = feature_cols.index("cos_hour")
 
-    # 讀取歷史數據檔建立 Scaler
+    # 讀取歷史數據檔建立 Scaler 與 24小時日變化 Profile
     csv_path = "dataset_for_lstm.csv"
     if not os.path.exists(csv_path):
         raise FileNotFoundError("找不到 dataset_for_lstm.csv")
@@ -60,14 +60,17 @@ def dynamic_predict_24h(current_hour, live_features_list):
     df_history["wind_y"] = np.sin(wind_rad)
 
     if "日期" in df_history.columns:
-        hours = pd.to_datetime(df_history["日期"]).dt.hour
+        df_history["hour"] = pd.to_datetime(df_history["日期"]).dt.hour
     elif "Time" in df_history.columns:
-        hours = pd.to_datetime(df_history["Time"]).dt.hour
+        df_history["hour"] = pd.to_datetime(df_history["Time"]).dt.hour
     else:
-        hours = df_history.index % 24
+        df_history["hour"] = df_history.index % 24
 
-    df_history["sin_hour"] = np.sin(2 * np.pi * hours / 24.0)
-    df_history["cos_hour"] = np.cos(2 * np.pi * hours / 24.0)
+    df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
+    df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
+
+    # 💡 【關鍵重點 1】計算 24 小時歷史平均 Profile (計算各小時的氣象與車流趨勢)
+    hourly_profile = df_history.groupby("hour")[feature_cols].mean()
 
     train_end = int(len(df_history) * 0.7)
     df_train = df_history.iloc[:train_end]
@@ -75,7 +78,7 @@ def dynamic_predict_24h(current_hour, live_features_list):
     scaler_X = MinMaxScaler().fit(df_train[feature_cols])
     scaler_y = MinMaxScaler().fit(df_train[[target_col]])
 
-    # 準備模型輸入視窗 (過去 23 小時 + 當前第 24 小時)
+    # 準備模型輸入視窗 (過去 23 小時 + 當前第 24 小時即時值)
     live_features_np = np.array(live_features_list, dtype=np.float32)
     recent_23 = df_history[feature_cols].iloc[-23:].values
     rolling_window = np.vstack([recent_23, live_features_np])
@@ -116,12 +119,16 @@ def dynamic_predict_24h(current_hour, live_features_list):
         future_time = current_hour_naive + datetime.timedelta(hours=step)
         future_times.append(future_time)
 
-        # 更新下一小時的滾動特徵
-        next_feature = rolling_window[-1].copy()
-        next_feature[pm25_idx] = pred_pm25
-        next_feature[sin_idx] = np.sin(2 * np.pi * future_time.hour / 24.0)
-        next_feature[cos_idx] = np.cos(2 * np.pi * future_time.hour / 24.0)
+        target_h = future_time.hour
 
+        # 💡 【關鍵重點 2】動態更新下一個小時的所有特徵，不再死板固定！
+        # 拿對應小時 (target_h) 的歷史氣象與車流 Profile 作為預期背景
+        next_feature = hourly_profile.loc[target_h].values.copy()
+
+        # 保持 PM2.5 來自模型的最新預測值
+        next_feature[pm25_idx] = pred_pm25
+
+        # 更新下一小時的滾動矩陣
         rolling_window = np.vstack([rolling_window[1:], next_feature])
 
     df_result = pd.DataFrame(
