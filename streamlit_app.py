@@ -85,7 +85,7 @@ def main():
         )
         return
 
-    # 5. 從 SQLite 讀取最新預測數據，並判斷是否需要重新執行預測
+    # 5. 從 SQLite 讀取最新預測數據
     def load_db_predictions():
         df = pd.DataFrame()
         if os.path.exists(db_file):
@@ -117,32 +117,36 @@ def main():
 
     df_pred = load_db_predictions()
 
-    # 💡 判斷資料庫是否過期 (最晚的預測時間 <= 當前時間)
+    # 💡 檢查最高預測時間是否到達未來
     need_run_application = False
+    current_hour_naive = current_hour.replace(tzinfo=None)
+
     if df_pred.empty:
         need_run_application = True
     else:
         df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
-        if df_pred["target_datetime"].max() <= current_hour.replace(tzinfo=None):
+        if df_pred["target_datetime"].max() <= current_hour_naive:
             need_run_application = True
 
-    # 💡 如果資料庫資料已過期，自動呼叫 application.main() 重新推論並寫入 SQLite
+    # 若歷史預測過期，自動重新計算
     if need_run_application:
-        with st.spinner("🔮 資料庫紀錄過期，正在呼叫 LSTM 模型即時推論未來 24 小時趨勢..."):
+        with st.spinner("🔮 正在呼叫 LSTM 模型即時推論未來 24 小時趨勢..."):
             try:
-                application.main()  # 執行完整的推論與資料庫同步流程
-                df_pred = load_db_predictions()  # 重新從資料庫載入最新產生的 24h 預測
+                application.main()
+                df_pred = load_db_predictions()
             except Exception as e:
                 st.warning(f"⚠️ 即時模型計算失敗: {e}")
 
     # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
         df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
+        
+        # 💡 【核心修正 1】剔除所有小於當前整點的舊時間點，只留下當前與未來！
+        df_pred = df_pred[df_pred["target_datetime"] >= current_hour_naive].copy()
+        
         df_pred = df_pred.sort_values(
             by="target_datetime", ascending=True
         ).drop_duplicates(subset=["target_datetime"]).reset_index(drop=True)
-
-        current_hour_naive = current_hour.replace(tzinfo=None)
 
         fig = go.Figure()
 
@@ -157,7 +161,7 @@ def main():
             )
         )
 
-        # 預測折線 (藍線：從基準時間向右延伸未來 24 小時)
+        # 預測折線 (藍線：從當前時間向右延伸至未來 24 小時)
         fig.add_trace(
             go.Scatter(
                 x=df_pred["target_datetime"],
@@ -183,12 +187,15 @@ def main():
             annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
         )
 
-        # 設定 Plotly X 軸
+        # 💡 【核心修正 2】強行指定 X 軸視窗範圍：最左邊為當前整點，最右邊為未來 24 小時
+        end_time_24h = current_hour_naive + datetime.timedelta(hours=24)
+
         fig.update_layout(
             xaxis=dict(
                 title="預測時間點",
                 type="date",
                 tickformat="%m/%d %H:00",
+                range=[current_hour_naive, end_time_24h], # 👈 強制鎖定範圍
             ),
             yaxis_title="PM2.5 濃度 (µg/m³)",
             hovermode="x unified",
