@@ -35,35 +35,20 @@ def main():
     if st.sidebar.button("🔄 刷新即時監測數據"):
         st.rerun()
 
-   # 1. 處理當前時間 (鎖定台灣時區)
+    # 1. 處理當前時間 (精準鎖定台灣時間 Today)
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
     current_hour = now.replace(minute=0, second=0, microsecond=0)
-    
-    # 強制格式化為當前的真實日期時間 (例如 2026-08-07 11:00)
     current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
 
-    # 💡 直接顯示當前的真實時間，不再拿舊資料庫的歷史日期來蓋掉今天
+    # 💡 側邊欄直接顯示當前真正的日期與小時 (例如 2026-08-07 11:00)
     st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
 
-    # 2. 從資料庫獲取排程器真正寫入的最新 base_time
-    latest_base_time = current_time_str
-    if os.path.exists(db_file):
-        try:
-            conn = sqlite3.connect(db_file)
-            cursor = conn.cursor()
-            cursor.execute("SELECT MAX(base_time) FROM predictions")
-            row = cursor.fetchone()
-            if row and row[0]:
-                latest_base_time = row[0]
-            conn.close()
-        except Exception:
-            pass
+    db_file = os.path.join(current_dir, "pm25_forecast.db")
+    if not os.path.exists(db_file):
+        db_file = os.path.join(current_dir, "pm25_data.db")
 
-    # 側邊欄顯示排程器最後更新時間
-    st.sidebar.write(f"🕒 **當前基準時間**: {latest_base_time}")
-
-    # 3. 抓取即時資料 (防護機制： API 卡死時自動進入備援模式)
+    # 2. 抓取即時資料 (防護機制： API 卡死時自動進入備援模式)
     live_features_list = [0.0] * 14
     with st.spinner("📡 正在擷取霧峰即時監測數據..."):
         try:
@@ -74,10 +59,10 @@ def main():
             live_features_list[1] = 28.0  # 氣溫
             live_features_list[2] = 75.0  # 濕度
             live_features_list[3] = 1.5   # 風速
-            live_features_list[7] = 12.0  # PM2.5
-            live_features_list[8] = 1200  # 車流量
+            live_features_list[7] = 13.0  # PM2.5
+            live_features_list[8] = 450   # 車流量
 
-    # 4. 頂部即時指標卡片
+    # 3. 頂部即時指標卡片
     st.subheader("📊 即時監測數據 Summary")
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("即時 PM2.5", f"{live_features_list[7]:.1f} µg/m³")
@@ -90,7 +75,7 @@ def main():
 
     st.markdown("---")
 
-    # 5. 檢查模型權重
+    # 4. 檢查模型權重
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
     model_path = "best_model_ExpC_Cyclic.pth"
@@ -100,14 +85,12 @@ def main():
         )
         return
 
-    # 6. 讀取 SQLite 最新一批預測數據 (💡 精準鎖定 MAX base_time)
+    # 5. 讀取 SQLite 最新預測數據
     df_pred = pd.DataFrame()
 
     if os.path.exists(db_file):
         try:
             conn = sqlite3.connect(db_file)
-
-            # 💡 【終極修正 SQL】只拿「最新一次基準時間 (MAX base_time)」產生的 24 小時預測，按 step 正序排
             query = """
                 SELECT target_time, pred_pm25 AS predicted_pm25, step
                 FROM predictions
@@ -118,7 +101,6 @@ def main():
             try:
                 df_pred = pd.read_sql_query(query, conn)
             except Exception:
-                # 備援查詢 (若無 step/base_time 欄位)
                 query_backup = """
                     SELECT target_time, predicted_pm25 
                     FROM predictions 
@@ -132,9 +114,8 @@ def main():
         except Exception as e:
             st.error(f"讀取 SQLite 預測數據失敗: {e}")
 
-    # 7. 繪製 Plotly 圖表與表格
+    # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
-        # 強制轉換為標準 Datetime 並排序
         df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
         df_pred = df_pred.sort_values(
             by="target_datetime", ascending=True
@@ -155,7 +136,7 @@ def main():
             )
         )
 
-        # 預測折線 (藍線：最新一批 24 小時預測)
+        # 預測折線
         fig.add_trace(
             go.Scatter(
                 x=df_pred["target_datetime"],
