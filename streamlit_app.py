@@ -7,7 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# **強制鎖定工作目錄**，確保 Streamlit 與本地模組使用同一個相對路徑
+# 強制鎖定工作目錄，確保與本地模組使用同一個相對路徑
 current_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(current_dir)
 
@@ -35,7 +35,7 @@ def main():
     if st.sidebar.button("🔄 刷新即時監測數據"):
         st.rerun()
 
-    # 1. 處理當前時間 (鎖定台灣時間 Today)
+    # 1. 處理當前時間 (鎖定台灣時間)
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
     current_hour = now.replace(minute=0, second=0, microsecond=0)
@@ -85,66 +85,59 @@ def main():
         )
         return
 
-    # 5. 讀取 SQLite 最新預測數據，並檢查是否需要「即時重新預測」
-    df_pred = pd.DataFrame()
-
-    if os.path.exists(db_file):
-        try:
-            conn = sqlite3.connect(db_file)
-            query = """
-                SELECT target_time, pred_pm25 AS predicted_pm25, step
-                FROM predictions
-                WHERE base_time = (SELECT MAX(base_time) FROM predictions)
-                ORDER BY step ASC
-                LIMIT 24
-            """
+    # 5. 從 SQLite 讀取最新預測數據，並判斷是否需要重新執行預測
+    def load_db_predictions():
+        df = pd.DataFrame()
+        if os.path.exists(db_file):
             try:
-                df_pred = pd.read_sql_query(query, conn)
-            except Exception:
-                query_backup = """
-                    SELECT target_time, predicted_pm25 
-                    FROM predictions 
-                    ORDER BY id DESC LIMIT 24
+                conn = sqlite3.connect(db_file)
+                query = """
+                    SELECT target_time, pred_pm25 AS predicted_pm25, step
+                    FROM predictions
+                    WHERE base_time = (SELECT MAX(base_time) FROM predictions)
+                    ORDER BY step ASC
+                    LIMIT 24
                 """
-                df_pred = pd.read_sql_query(query_backup, conn)
-                if not df_pred.empty:
-                    df_pred = df_pred.iloc[::-1].reset_index(drop=True)
+                try:
+                    df = pd.read_sql_query(query, conn)
+                except Exception:
+                    query_backup = """
+                        SELECT target_time, predicted_pm25 
+                        FROM predictions 
+                        ORDER BY id DESC LIMIT 24
+                    """
+                    df = pd.read_sql_query(query_backup, conn)
+                    if not df.empty:
+                        df = df.iloc[::-1].reset_index(drop=True)
 
-            conn.close()
-        except Exception as e:
-            st.error(f"讀取 SQLite 預測數據失敗: {e}")
+                conn.close()
+            except Exception as e:
+                st.error(f"讀取 SQLite 預測數據失敗: {e}")
+        return df
 
-    # 💡 【核心新增】如果資料庫資料過期（預測時間全在過去），則觸發即時模型推論產生「未來 24 小時」！
-    need_live_predict = False
+    df_pred = load_db_predictions()
+
+    # 💡 判斷資料庫是否過期 (最晚的預測時間 <= 當前時間)
+    need_run_application = False
     if df_pred.empty:
-        need_live_predict = True
+        need_run_application = True
     else:
         df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
-        # 如果預測結果的最後一個點比當前整點還小或相等，表示資料庫資料已過期
         if df_pred["target_datetime"].max() <= current_hour.replace(tzinfo=None):
-            need_live_predict = True
+            need_run_application = True
 
-    if need_live_predict:
-        try:
-            # 呼叫 application.py 直接進行實時預測
-            preds = application.predict_future_24h(live_features_list)
-            
-            # 建立以當前整點為基準、往後推 24 小時的時間軸
-            future_times = [
-                (current_hour + datetime.timedelta(hours=i + 1)).strftime("%Y-%m-%d %H:00")
-                for i in range(24)
-            ]
-            
-            df_pred = pd.DataFrame({
-                "target_time": future_times,
-                "predicted_pm25": preds
-            })
-            df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
-        except Exception as e:
-            st.warning(f"⚠️ 即時推論預測失敗，顯示最新可用的歷史紀錄: {e}")
+    # 💡 如果資料庫資料已過期，自動呼叫 application.main() 重新推論並寫入 SQLite
+    if need_run_application:
+        with st.spinner("🔮 資料庫紀錄過期，正在呼叫 LSTM 模型即時推論未來 24 小時趨勢..."):
+            try:
+                application.main()  # 執行完整的推論與資料庫同步流程
+                df_pred = load_db_predictions()  # 重新從資料庫載入最新產生的 24h 預測
+            except Exception as e:
+                st.warning(f"⚠️ 即時模型計算失敗: {e}")
 
     # 6. 繪製 Plotly 圖表與表格
     if not df_pred.empty:
+        df_pred["target_datetime"] = pd.to_datetime(df_pred["target_time"])
         df_pred = df_pred.sort_values(
             by="target_datetime", ascending=True
         ).drop_duplicates(subset=["target_datetime"]).reset_index(drop=True)
@@ -164,7 +157,7 @@ def main():
             )
         )
 
-        # 預測折線 (藍線：從基準時間的下一個小時開始往右延伸 24 小時)
+        # 預測折線 (藍線：從基準時間向右延伸未來 24 小時)
         fig.add_trace(
             go.Scatter(
                 x=df_pred["target_datetime"],
