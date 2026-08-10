@@ -24,7 +24,6 @@ st.set_page_config(
 
 
 @st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
-
 def dynamic_predict_24h(current_hour, live_features_list):
     """根據當前動態基準時間與即時特徵，使用 LSTM 模型直接推論未來 24 小時數值"""
     feature_cols = [
@@ -69,7 +68,7 @@ def dynamic_predict_24h(current_hour, live_features_list):
     df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
     df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
 
-    # 💡 【關鍵重點 1】計算 24 小時歷史平均 Profile (計算各小時的氣象與車流趨勢)
+    # 💡 計算 24 小時歷史平均 Profile (計算各小時的氣象與車流趨勢)
     hourly_profile = df_history.groupby("hour")[feature_cols].mean()
 
     train_end = int(len(df_history) * 0.7)
@@ -121,8 +120,7 @@ def dynamic_predict_24h(current_hour, live_features_list):
 
         target_h = future_time.hour
 
-        # 💡 【關鍵重點 2】動態更新下一個小時的所有特徵，不再死板固定！
-        # 拿對應小時 (target_h) 的歷史氣象與車流 Profile 作為預期背景
+        # 💡 動態更新下一個小時的所有特徵 (氣象、車流量日變化)，不再死板固定！
         next_feature = hourly_profile.loc[target_h].values.copy()
 
         # 保持 PM2.5 來自模型的最新預測值
@@ -135,6 +133,89 @@ def dynamic_predict_24h(current_hour, live_features_list):
         {"target_datetime": future_times, "predicted_pm25": future_predictions}
     )
     return df_result
+
+
+def get_fallback_features(current_hour):
+    """當 API 暫時連不上時，優先從 SQLite 資料庫讀取最後成功紀錄；若 DB 無紀錄則從歷史 Profiles 取得動態平均值"""
+    try:
+        conn = sqlite3.connect("pm25_forecast.db")
+        df_db = pd.read_sql(
+            "SELECT * FROM realtime_logs ORDER BY timestamp DESC LIMIT 1", conn
+        )
+        conn.close()
+        if not df_db.empty:
+            feature_cols = [
+                "測站氣壓(hPa)",
+                "氣溫(℃)",
+                "相對溼度(%)",
+                "風速(m/s)",
+                "wind_x",
+                "wind_y",
+                "降水量(mm)",
+                "pm25",
+                "03F2100N",
+                "03F2100S",
+                "03F2125N",
+                "03F2129S",
+                "sin_hour",
+                "cos_hour",
+            ]
+            return df_db[feature_cols].iloc[0].tolist()
+    except Exception:
+        pass
+
+    # 若 DB 讀取失敗，讀取歷史 dataset 算當前小時的 mean
+    csv_path = "dataset_for_lstm.csv"
+    if os.path.exists(csv_path):
+        df_history = pd.read_csv(csv_path)
+        wind_rad = np.radians(df_history["風向(360degree)"])
+        df_history["wind_x"] = np.cos(wind_rad)
+        df_history["wind_y"] = np.sin(wind_rad)
+        if "日期" in df_history.columns:
+            df_history["hour"] = pd.to_datetime(df_history["日期"]).dt.hour
+        else:
+            df_history["hour"] = df_history.index % 24
+
+        df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
+        df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
+
+        feature_cols = [
+            "測站氣壓(hPa)",
+            "氣溫(℃)",
+            "相對溼度(%)",
+            "風速(m/s)",
+            "wind_x",
+            "wind_y",
+            "降水量(mm)",
+            "pm25",
+            "03F2100N",
+            "03F2100S",
+            "03F2125N",
+            "03F2129S",
+            "sin_hour",
+            "cos_hour",
+        ]
+        target_h = current_hour.hour
+        profile = df_history.groupby("hour")[feature_cols].mean()
+        return profile.loc[target_h].values.tolist()
+
+    # 預防性備援預設值
+    return [
+        1008.0,
+        28.0,
+        75.0,
+        1.5,
+        0.0,
+        1.0,
+        0.0,
+        10.0,
+        450.0,
+        420.0,
+        460.0,
+        430.0,
+        0.0,
+        1.0,
+    ]
 
 
 def main():
@@ -163,29 +244,33 @@ def main():
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
-            st.warning(f"⚠️ 即時數據 API 暫時無回應，切換至備援數據: {e}")
-            live_features_list[1] = 28.0
-            live_features_list[2] = 75.0
-            live_features_list[3] = 1.5
-            live_features_list[7] = 13.0
-            live_features_list[8] = 450
+            st.warning(
+                f"⚠️ 即時 API 暫時無回應，切換至動態備援數據 (DB/歷史 Profile): {e}"
+            )
+            live_features_list = get_fallback_features(current_hour)
+
+    # 計算國道 3 號關鍵門架流量 (北上 03F2100N 與 南下 03F2100S)
+    traffic_north = live_features_list[8]
+    traffic_south = live_features_list[9]
+    traffic_total = traffic_north + traffic_south
 
     # 3. 即時數據 Summary
     st.subheader("📊 即時監測數據 Summary")
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("即時 PM2.5", f"{live_features_list[7]:.1f} µg/m³")
     col2.metric("氣溫", f"{live_features_list[1]:.1f} ℃")
     col3.metric("相對濕度", f"{live_features_list[2]:.0f} %")
     col4.metric("風速", f"{live_features_list[3]:.1f} m/s")
-    col5.metric(
-        "國道3號車流量 (北上)", f"{int(live_features_list[8])} 輛/時"
-    )
+    col5.metric("國道 3 號 (北上)", f"{int(traffic_north)} 輛/時")
+    col6.metric("國道 3 號 (雙向總流量)", f"{int(traffic_total)} 輛/時")
 
     st.markdown("---")
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
     # 4. 強制以【當前基準時間】為起點，動態計算未來完整的 24 小時預測
-    with st.spinner("🔮 正在根據最新基準時間即時計算未來 24 小時趨勢..."):
+    with st.spinner(
+        "🔮 正在根據最新基準時間即時計算未來 24 小時趨勢..."
+    ):
         try:
             df_pred = dynamic_predict_24h(current_hour, live_features_list)
         except Exception as e:
@@ -209,7 +294,7 @@ def main():
         )
     )
 
-    # 未來 24 小時預測折線 (藍線：從 13:00 延伸到隔天 12:00)
+    # 未來 24 小時預測折線 (藍線：從基準時間延伸到隔天)
     fig.add_trace(
         go.Scatter(
             x=df_pred["target_datetime"],
@@ -255,7 +340,9 @@ def main():
     st.subheader("📋 未來 24 小時預測數值明細")
     df_display = pd.DataFrame(
         {
-            "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
+            "預測時間點": df_pred["target_datetime"].dt.strftime(
+                "%m/%d %H:00"
+            ),
             "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
         }
     )
