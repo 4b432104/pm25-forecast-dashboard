@@ -46,9 +46,8 @@ class MultivariateLSTM(nn.Module):
         return out
 
 
-# 2. 自動化擷取【霧峰區】即時 14 項特徵 (採用高公局 M03A CSV 實測加總邏輯)
+# 2. 自動化擷取【霧峰區】即時 14 項特徵 (採用 TDX Open API 精準版)
 def fetch_wufeng_live_features():
-    # 💡 在函式最頂端先宣告當前時間，確保區域變數健全
     now = datetime.datetime.now()
     print("📡 開始連線擷取【台中霧峰區】三大類即時自變數...")
 
@@ -163,11 +162,10 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 - TDX API 乾淨版
+    # (C) 國道 3 號車流量 - TDX Open API (修正網址帶入與解析邏輯)
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     traffic_success = False
 
-    # 讀取 TDX 金鑰 (優先讀取 Secrets，若無則拿預設字串)
     try:
         import streamlit as st
         TDX_CLIENT_ID = st.secrets.get("TDX_CLIENT_ID", "4B432104-83730ef3-73df-4e83")
@@ -196,23 +194,28 @@ def fetch_wufeng_live_features():
             date_str = prev_hour_time.strftime("%Y-%m-%d")
             hour_str = prev_hour_time.strftime("%H")
 
-            filter_query = "$filter=GantryID eq '03F2100N' or GantryID eq '03F2100S' or GantryID eq '03F2125N' or GantryID eq '03F2129S'"
-            tdx_api_url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway/{date_str}?{filter_query}&$format=JSON"
+            # 正確使用 params 進行 URL 參數代入
+            tdx_api_url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway/{date_str}"
+            api_params = {
+                "$filter": "GantryID eq '03F2100N' or GantryID eq '03F2100S' or GantryID eq '03F2125N' or GantryID eq '03F2129S'",
+                "$format": "JSON"
+            }
 
-            res_traffic = requests.get(tdx_api_url, headers=tdx_headers, timeout=6)
+            res_traffic = requests.get(tdx_api_url, headers=tdx_headers, params=api_params, timeout=7)
 
             if res_traffic.status_code == 200:
                 traffic_data = res_traffic.json()
                 hourly_sum = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
 
                 for item in traffic_data:
-                    gantry_id = item.get('GantryID')
-                    traffics = item.get('GantryTraffics', []) or item.get('TrafficVolumes', []) or [item]
+                    gid = item.get('GantryID', '')
+                    traffics = item.get('GantryTraffics') or item.get('TrafficVolumes') or [item]
                     for tr in traffics:
-                        col_time = str(tr.get('CollectionTime', '')) or str(item.get('CollectionTime', ''))
-                        if f"T{hour_str}:" in col_time or f" {hour_str}:" in col_time:
+                        col_time = str(tr.get('CollectionTime') or item.get('CollectionTime') or '')
+                        # 比對時間字串
+                        if f"T{hour_str}:" in col_time or f" {hour_str}:" in col_time or f":{hour_str}:" in col_time:
                             vol = tr.get('TrafficVolume') or tr.get('Volume') or 0
-                            target_gid = tr.get('GantryID') or gantry_id
+                            target_gid = tr.get('GantryID') or gid
                             if target_gid in hourly_sum:
                                 hourly_sum[target_gid] += float(vol)
 
@@ -222,12 +225,11 @@ def fetch_wufeng_live_features():
                     v_2125N = hourly_sum['03F2125N']
                     v_2129S = hourly_sum['03F2129S']
                     traffic_success = True
-                    print(f"   [3/3] ✅ TDX 成功取得真實車流 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
-
+                    print(f"   [3/3] ✅ TDX API 成功取得【{hour_str}:00】真實流量 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
     except Exception as e:
-        print(f"   [3/3] ℹ️ TDX 讀取失敗: {e}")
+        print(f"   [3/3] ℹ️ TDX 讀取跳過: {e}")
 
-    # 第一備援：SQLite
+    # 第一備援：SQLite 本地歷史紀錄
     if not traffic_success:
         try:
             import sqlite3
@@ -241,6 +243,7 @@ def fetch_wufeng_live_features():
                 v_2129S = float(df_db["03F2129S"].iloc[0])
                 if v_2100N > 0 and v_2100S > 0:
                     traffic_success = True
+                    print(f"   [3/3] ✅ 成功從 SQLite 資料庫復原車流量 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
         except Exception:
             pass
 
@@ -250,7 +253,8 @@ def fetch_wufeng_live_features():
         v_2100N = float(base_val + (now.hour % 5) * 35)
         v_2100S = float(base_val - (now.hour % 3) * 25)
         v_2125N, v_2129S = v_2100N * 0.85, v_2100S * 0.85
-        
+        print(f"   [3/3] ℹ️ 採用時段動態保底值 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+
     # (D) 當前時間點之週期特徵 sin_hour & cos_hour
     sin_hour = np.sin(2 * np.pi * now.hour / 24.0)
     cos_hour = np.cos(2 * np.pi * now.hour / 24.0)
@@ -271,7 +275,6 @@ def fetch_wufeng_live_features():
         sin_hour,
         cos_hour,
     ]
-
 
 # 3. 主推論程式
 def main():
