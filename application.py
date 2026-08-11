@@ -163,124 +163,72 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 - 改回後台驗證 100% 成功的「高公局 M03A CSV 自動探測與 1 小時加總機制」
+    # (C) 國道 3 號車流量 - 防封鎖 & 診斷強化版
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     traffic_success = False
 
     try:
+        # 補全完整的瀏覽器偽裝 Header，防止被高公局伺服器阻擋
         traffic_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            ),
-            "Accept": "*/*",
-            "Host": "tisvcloud.freeway.gov.tw",
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Referer': 'https://tisvcloud.freeway.gov.tw/',
+            'Connection': 'keep-alive'
         }
+        
         latest_base_time = None
-        # 從目前時間開始往前探測最新發布的 5 分鐘 CSV 檔案
-        for offset_min in range(0, 30, 5):
+        # 探測最近 40 分鐘內最新發布的 5 分鐘 CSV 檔案
+        for offset_min in range(0, 40, 5):
             probe_time = now - datetime.timedelta(minutes=offset_min)
-            check_time = probe_time.replace(
-                minute=(probe_time.minute // 5) * 5, second=0, microsecond=0
-            )
-            ymd, hh, mm = (
-                check_time.strftime("%Y%m%d"),
-                check_time.strftime("%H"),
-                check_time.strftime("%M"),
-            )
+            check_time = probe_time.replace(minute=(probe_time.minute // 5) * 5, second=0, microsecond=0)
+            ymd, hh, mm = check_time.strftime("%Y%m%d"), check_time.strftime("%H"), check_time.strftime("%M")
             url_check = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+            
             try:
-                res_check = requests.head(
-                    url_check, headers=traffic_headers, timeout=2, verify=False
-                )
+                # 使用 GET 取代 HEAD，並關閉 SSL 驗證，設定 3 秒超時
+                res_check = requests.get(url_check, headers=traffic_headers, timeout=3, verify=False, stream=True)
                 if res_check.status_code == 200:
                     latest_base_time = check_time
+                    print(f"   [3/3] 🎯 找到高公局最新 5 分鐘流量檔: {ymd}_{hh}{mm}")
                     break
-            except Exception:
+            except Exception as req_err:
                 continue
 
         if not latest_base_time:
-            fallback_time = now - datetime.timedelta(minutes=15)
-            latest_base_time = fallback_time.replace(
-                minute=(fallback_time.minute // 5) * 5, second=0, microsecond=0
-            )
+            print("   [3/3] ⚠️ 探測高公局檔案失敗 (可能被伺服器阻擋或網路無法連線)")
+            
+        else:
+            hourly_vol = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
+            success_count = 0
 
-        hourly_vol = {
-            "03F2100N": 0.0,
-            "03F2100S": 0.0,
-            "03F2125N": 0.0,
-            "03F2129S": 0.0,
-        }
-        success_count = 0
+            # 下載過去 12 個 5 分鐘區間檔案並累加流量
+            for i in range(11, -1, -1):
+                target_time = latest_base_time - datetime.timedelta(minutes=i*5)
+                ymd, hh, mm = target_time.strftime("%Y%m%d"), target_time.strftime("%H"), target_time.strftime("%M")
+                url_csv = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+                try:
+                    res_csv = requests.get(url_csv, headers=traffic_headers, timeout=4, verify=False)
+                    if res_csv.status_code == 200:
+                        success_count += 1
+                        for line in res_csv.text.strip().split('\n'):
+                            parts = line.split(',')
+                            if len(parts) >= 5 and parts[1].strip() in hourly_vol:
+                                hourly_vol[parts[1].strip()] += float(parts[4].strip())
+                except Exception:
+                    continue
 
-        # 下載過去 12 個 5 分鐘區間檔案並累加車流量
-        for i in range(11, -1, -1):
-            target_time = latest_base_time - datetime.timedelta(minutes=i * 5)
-            ymd, hh, mm = (
-                target_time.strftime("%Y%m%d"),
-                target_time.strftime("%H"),
-                target_time.strftime("%M"),
-            )
-            url_csv = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
-            try:
-                res_csv = requests.get(
-                    url_csv, headers=traffic_headers, timeout=3, verify=False
-                )
-                if res_csv.status_code == 200:
-                    success_count += 1
-                    for line in res_csv.text.strip().split("\n"):
-                        parts = line.split(",")
-                        if len(parts) >= 5 and parts[1].strip() in hourly_vol:
-                            hourly_vol[parts[1].strip()] += float(
-                                parts[4].strip()
-                            )
-            except Exception:
-                continue
-
-        if success_count > 0:
-            scale_factor = 12.0 / success_count
-            v_2100N = hourly_vol["03F2100N"] * scale_factor
-            v_2100S = hourly_vol["03F2100S"] * scale_factor
-            v_2125N = hourly_vol["03F2125N"] * scale_factor
-            v_2129S = hourly_vol["03F2129S"] * scale_factor
-            traffic_success = True
-            print(
-                f"   [3/3] ✅ 成功透過高公局 M03A CSV 探測解析 {success_count}/12"
-                f" 份檔案 -> 北上: {int(v_2100N)} 輛, 南下: {int(v_2100S)} 輛"
-            )
-    except Exception as e:
-        print(f"   [3/3] ℹ️ M03A CSV 自動探測跳過: {e}")
-
-    # 若 M03A 即時探測失敗，第二層防線：嘗試從 SQLite 撈最近一次歷史紀錄備援
-    if not traffic_success:
-        try:
-            import sqlite3
-
-            conn = sqlite3.connect("pm25_forecast.db")
-            df_db = pd.read_sql(
-                "SELECT * FROM realtime_logs ORDER BY timestamp DESC LIMIT 1",
-                conn,
-            )
-            conn.close()
-            if (
-                not df_db.empty
-                and float(df_db["03F2100N"].iloc[0]) not in [450.0, 620.0]
-            ):
-                v_2100N = float(df_db["03F2100N"].iloc[0])
-                v_2100S = float(df_db["03F2100S"].iloc[0])
-                v_2125N = float(df_db["03F2125N"].iloc[0])
-                v_2129S = float(df_db["03F2129S"].iloc[0])
+            if success_count > 0:
+                scale_factor = 12.0 / success_count
+                v_2100N = hourly_vol['03F2100N'] * scale_factor
+                v_2100S = hourly_vol['03F2100S'] * scale_factor
+                v_2125N = hourly_vol['03F2125N'] * scale_factor
+                v_2129S = hourly_vol['03F2129S'] * scale_factor
                 traffic_success = True
-                print(
-                    f"   [3/3] ✅ 復原 SQLite 資料庫最新車流 -> 北上:"
-                    f" {int(v_2100N)}, 南下: {int(v_2100S)}"
-                )
-        except Exception:
-            pass
+                print(f"   [3/3] ✅ 成功解析高公局 M03A 資料 ({success_count}/12 份) -> 北上: {int(v_2100N)} 輛, 南下: {int(v_2100S)} 輛")
 
-    # 第三層防線：最終保底值
-    if not traffic_success:
-        print("   [3/3] ℹ️ CSV 與 DB 均無資料，採用預設時間估計值")
-        v_2100N, v_2100S, v_2125N, v_2129S = 620.0, 580.0, 510.0, 490.0
+    except Exception as e:
+        print(f"   [3/3] ❌ 車流抓取過程中發生錯誤: {e}")
 
     # (D) 當前時間點之週期特徵 sin_hour & cos_hour
     sin_hour = np.sin(2 * np.pi * now.hour / 24.0)
