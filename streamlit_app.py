@@ -132,82 +132,81 @@ def dynamic_predict_24h(current_hour, live_features_list):
 
 def get_fallback_features(prev_hour):
     """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 歷史 Profile)"""
+    feature_cols = [
+        "測站氣壓(hPa)",
+        "氣溫(℃)",
+        "相對溼度(%)",
+        "風速(m/s)",
+        "wind_x",
+        "wind_y",
+        "降水量(mm)",
+        "pm25",
+        "03F2100N",
+        "03F2100S",
+        "03F2125N",
+        "03F2129S",
+        "sin_hour",
+        "cos_hour",
+    ]
+
+    # 1. 嘗試從 SQLite 資料庫讀取最近一次真實紀錄
     try:
         conn = sqlite3.connect("pm25_forecast.db")
         df_db = pd.read_sql(
             "SELECT * FROM realtime_logs ORDER BY timestamp DESC LIMIT 1", conn
         )
         conn.close()
-        if not df_db.empty:
-            feature_cols = [
-                "測站氣壓(hPa)",
-                "氣溫(℃)",
-                "相對溼度(%)",
-                "風速(m/s)",
-                "wind_x",
-                "wind_y",
-                "降水量(mm)",
-                "pm25",
-                "03F2100N",
-                "03F2100S",
-                "03F2125N",
-                "03F2129S",
-                "sin_hour",
-                "cos_hour",
-            ]
+        if not df_db.empty and all(col in df_db.columns for col in feature_cols):
             return df_db[feature_cols].iloc[0].tolist()
     except Exception:
         pass
 
+    # 2. 嘗試從歷史數據集 (dataset_for_lstm.csv) 計算該小時的平均 Profile
     csv_path = "dataset_for_lstm.csv"
     if os.path.exists(csv_path):
-        df_history = pd.read_csv(csv_path)
-        wind_rad = np.radians(df_history["風向(360degree)"])
-        df_history["wind_x"] = np.cos(wind_rad)
-        df_history["wind_y"] = np.sin(wind_rad)
-        if "日期" in df_history.columns:
-            df_history["hour"] = pd.to_datetime(df_history["日期"]).dt.hour
-        else:
-            df_history["hour"] = df_history.index % 24
+        try:
+            df_history = pd.read_csv(csv_path)
+            wind_rad = np.radians(df_history["風向(360degree)"])
+            df_history["wind_x"] = np.cos(wind_rad)
+            df_history["wind_y"] = np.sin(wind_rad)
 
-        df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
-        df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
+            if "日期" in df_history.columns:
+                df_history["hour"] = pd.to_datetime(df_history["日期"]).dt.hour
+            elif "Time" in df_history.columns:
+                df_history["hour"] = pd.to_datetime(df_history["Time"]).dt.hour
+            else:
+                df_history["hour"] = df_history.index % 24
 
-        feature_cols = [
-            "測站氣壓(hPa)",
-            "氣溫(℃)",
-            "相對溼度(%)",
-            "風速(m/s)",
-            "wind_x",
-            "wind_y",
-            "降水量(mm)",
-            "pm25",
-            "03F2100N",
-            "03F2100S",
-            "03F2125N",
-            "03F2129S",
-            "sin_hour",
-            "cos_hour",
-        ]
-        target_h = prev_hour.hour
-        profile = df_history.groupby("hour")[feature_cols].mean()
-        return profile.loc[target_h].values.tolist()
+            df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
+            df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
+
+            target_h = prev_hour.hour
+            profile = df_history.groupby("hour")[feature_cols].mean()
+            if target_h in profile.index:
+                return profile.loc[target_h].values.tolist()
+        except Exception:
+            pass
+
+    # 3. 若以上皆失敗，回傳合理的動態預設值
+    h = prev_hour.hour
+    sin_h = float(np.sin(2 * np.pi * h / 24.0))
+    cos_h = float(np.cos(2 * np.pi * h / 24.0))
 
     return [
-        1008.0,
-        28.0,
-        75.0,
-        1.5,
-        0.0,
-        1.0,
-        0.0,
-        10.0,
-        450.0,
-        480.0,
-        460.0,
-        430.0,
-        0.0,
-        1.0,
+        1008.5,  # 測站氣壓
+        24.5,    # 氣溫
+        75.0,    # 相對溼度
+        1.8,     # 風速
+        0.0,     # wind_x
+        -1.0,    # wind_y
+        0.0,     # 降水量
+        15.0,    # pm25
+        620.0,   # 03F2100N
+        580.0,   # 03F2100S
+        510.0,   # 03F2125N
+        490.0,   # 03F2129S
+        sin_h,   # sin_hour
+        cos_h,   # cos_hour
     ]
 
 
@@ -219,6 +218,7 @@ def main():
 
     st.sidebar.header("⚙️ 系統狀態與設定")
     if st.sidebar.button("🔄 刷新即時監測數據"):
+        st.cache_data.clear()
         st.rerun()
 
     # 1. 精準計算【基準時間】與【前一小時車流區間】
@@ -245,7 +245,7 @@ def main():
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
             st.warning(
-                f"⚠️ 即時 API 暫時無回應，切換至 [{traffic_range_str}] 動態備援數據: {e}"
+                f"⚠️ 即時 API 暫時無回應，切換至 [{traffic_range_str}] 動態備援數據"
             )
             live_features_list = get_fallback_features(prev_hour)
 
