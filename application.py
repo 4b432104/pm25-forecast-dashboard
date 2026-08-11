@@ -165,8 +165,8 @@ def fetch_wufeng_live_features():
     traffic_success = False
 
     # 🔑 請替換成你在 TDX 申請的 Client ID 與 Client Secret
-    TDX_CLIENT_ID = "YOUR_CLIENT_ID_HERE"
-    TDX_CLIENT_SECRET = "YOUR_CLIENT_SECRET_HERE"
+    TDX_CLIENT_ID = "4B432104-83730ef3-73df-4e83"
+    TDX_CLIENT_SECRET = "08a92cec-5d0d-4957-a36a-8262df6df642"
 
     try:
         # 1. 向 TDX 取得 OAuth Token
