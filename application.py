@@ -46,7 +46,7 @@ class MultivariateLSTM(nn.Module):
         return out
 
 
-# 2. 自動化擷取【霧峰區】即時 14 項特徵 (採用 TDX Open API 精準版)
+# 2. 自動化擷取【霧峰區】即時 14 項特徵 (採用 TDX Open API 終極修復版)
 def fetch_wufeng_live_features():
     now = datetime.datetime.now()
     print("📡 開始連線擷取【台中霧峰區】三大類即時自變數...")
@@ -162,7 +162,7 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 - TDX Open API (修正網址帶入與解析邏輯)
+    # (C) 國道 3 號車流量 - TDX Open API (記憶體過濾 + 時間追溯絕殺版)
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     traffic_success = False
 
@@ -190,46 +190,49 @@ def fetch_wufeng_live_features():
                 'Accept': 'application/json'
             }
 
-            prev_hour_time = now - datetime.timedelta(hours=1)
-            date_str = prev_hour_time.strftime("%Y-%m-%d")
-            hour_str = prev_hour_time.strftime("%H")
+            # 嘗試抓取近 3 小時內的資料（防止 TDX 上架延遲）
+            target_gantries = {'03F2100N', '03F2100S', '03F2125N', '03F2129S'}
+            
+            for hour_offset in [1, 2, 3]:
+                check_time = now - datetime.timedelta(hours=hour_offset)
+                date_str = check_time.strftime("%Y-%m-%d")
+                hour_str = check_time.strftime("%H")
 
-            # 正確使用 params 進行 URL 參數代入
-            tdx_api_url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway/{date_str}"
-            api_params = {
-                "$filter": "GantryID eq '03F2100N' or GantryID eq '03F2100S' or GantryID eq '03F2125N' or GantryID eq '03F2129S'",
-                "$format": "JSON"
-            }
+                # 直接請求當日全部 M03A 資料 (不帶可能失敗的 $filter)
+                tdx_api_url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway/{date_str}?$format=JSON"
+                res_traffic = requests.get(tdx_api_url, headers=tdx_headers, timeout=8)
 
-            res_traffic = requests.get(tdx_api_url, headers=tdx_headers, params=api_params, timeout=7)
+                if res_traffic.status_code == 200:
+                    traffic_data = res_traffic.json()
+                    hourly_sum = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
 
-            if res_traffic.status_code == 200:
-                traffic_data = res_traffic.json()
-                hourly_sum = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
+                    for item in traffic_data:
+                        gid = item.get('GantryID', '')
+                        if gid in target_gantries:
+                            traffics = item.get('GantryTraffics') or item.get('TrafficVolumes') or [item]
+                            for tr in traffics:
+                                col_time = str(tr.get('CollectionTime') or item.get('CollectionTime') or '')
+                                if f":{hour_str}:" in col_time or f"T{hour_str}:" in col_time or f" {hour_str}:" in col_time:
+                                    vol = tr.get('TrafficVolume') or tr.get('Volume') or 0
+                                    hourly_sum[gid] += float(vol)
 
-                for item in traffic_data:
-                    gid = item.get('GantryID', '')
-                    traffics = item.get('GantryTraffics') or item.get('TrafficVolumes') or [item]
-                    for tr in traffics:
-                        col_time = str(tr.get('CollectionTime') or item.get('CollectionTime') or '')
-                        # 比對時間字串
-                        if f"T{hour_str}:" in col_time or f" {hour_str}:" in col_time or f":{hour_str}:" in col_time:
-                            vol = tr.get('TrafficVolume') or tr.get('Volume') or 0
-                            target_gid = tr.get('GantryID') or gid
-                            if target_gid in hourly_sum:
-                                hourly_sum[target_gid] += float(vol)
+                    if sum(hourly_sum.values()) > 0:
+                        v_2100N = hourly_sum['03F2100N']
+                        v_2100S = hourly_sum['03F2100S']
+                        v_2125N = hourly_sum['03F2125N']
+                        v_2129S = hourly_sum['03F2129S']
+                        traffic_success = True
+                        print(f"   [3/3] 🎉 TDX API 成功取得【{date_str} {hour_str}:00】真實流量 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+                        break
+                else:
+                    print(f"   [3/3] ❌ TDX HTTP 錯誤 {res_traffic.status_code}")
+        else:
+            print(f"   [3/3] 🔑 TDX Token 失敗 HTTP {res_token.status_code}")
 
-                if sum(hourly_sum.values()) > 0:
-                    v_2100N = hourly_sum['03F2100N']
-                    v_2100S = hourly_sum['03F2100S']
-                    v_2125N = hourly_sum['03F2125N']
-                    v_2129S = hourly_sum['03F2129S']
-                    traffic_success = True
-                    print(f"   [3/3] ✅ TDX API 成功取得【{hour_str}:00】真實流量 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
     except Exception as e:
-        print(f"   [3/3] ℹ️ TDX 讀取跳過: {e}")
+        print(f"   [3/3] ℹ️ TDX 異常: {e}")
 
-    # 第一備援：SQLite 本地歷史紀錄
+    # 第一備援：SQLite
     if not traffic_success:
         try:
             import sqlite3
@@ -243,7 +246,7 @@ def fetch_wufeng_live_features():
                 v_2129S = float(df_db["03F2129S"].iloc[0])
                 if v_2100N > 0 and v_2100S > 0:
                     traffic_success = True
-                    print(f"   [3/3] ✅ 成功從 SQLite 資料庫復原車流量 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+                    print(f"   [3/3] ✅ 從 SQLite 資料庫備援復原 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
         except Exception:
             pass
 
@@ -253,7 +256,7 @@ def fetch_wufeng_live_features():
         v_2100N = float(base_val + (now.hour % 5) * 35)
         v_2100S = float(base_val - (now.hour % 3) * 25)
         v_2125N, v_2129S = v_2100N * 0.85, v_2100S * 0.85
-        print(f"   [3/3] ℹ️ 採用時段動態保底值 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+        print(f"   [3/3] ℹ️ 採用動態保底 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
 
     # (D) 當前時間點之週期特徵 sin_hour & cos_hour
     sin_hour = np.sin(2 * np.pi * now.hour / 24.0)
