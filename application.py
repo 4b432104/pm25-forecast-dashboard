@@ -163,64 +163,72 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 - 精準讀取「上一個完整小時」M03A 資料夾
+    # (C) 國道 3 號車流量 - TDX 官方 Open API 版 (支援 Streamlit 雲端連線)
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     traffic_success = False
 
+    # 🔑 請填入你在 TDX 平台申請的憑證
+    TDX_CLIENT_ID = "4B432104-83730ef3-73df-4e83"       # 請替換為你的 Client ID
+    TDX_CLIENT_SECRET = "08a92cec-5d0d-4957-a36a-8262df6df642" # 請替換為你的 Client Secret
+
     try:
-        # 1. 取得上一個完整小時的時間物件 (自動處理跨日與跨月)
-        prev_hour_time = now - datetime.timedelta(hours=1)
-        ymd = prev_hour_time.strftime("%Y%m%d")
-        hh = prev_hour_time.strftime("%H")
-
-        print(f"   [3/3] 📡 開始抓取高公局 M03A 資料夾【{ymd}/{hh}】整點 1 小時完整流量...")
-
-        traffic_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Referer': 'https://tisvcloud.freeway.gov.tw/',
-            'Connection': 'keep-alive'
+        # 1. 取得 TDX 存取權限 Token
+        token_url = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
+        token_data = {
+            'grant_type': 'client_credentials',
+            'client_id': TDX_CLIENT_ID,
+            'client_secret': TDX_CLIENT_SECRET
         }
+        res_token = requests.post(token_url, data=token_data, timeout=5)
+        
+        if res_token.status_code == 200:
+            access_token = res_token.json().get('access_token')
+            tdx_headers = {
+                'Authorization': f'Bearer {access_token}',
+                'Accept': 'application/json'
+            }
 
-        # 準備存放門架流量累計的字典
-        target_gantries = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
-        success_files = 0
-
-        # 2. 迴圈讀取該小時資料夾內的 12 個 5 分鐘 CSV 檔案 (00, 05, 10, ..., 55 分)
-        for mm_int in range(0, 60, 5):
-            mm = f"{mm_int:02d}"
-            url_csv = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+            # 2. 計算上一個小時的時間範圍 ( format: YYYY-MM-DDTHH:00:00 )
+            prev_hour_time = now - datetime.timedelta(hours=1)
+            date_str = prev_hour_time.strftime("%Y-%m-%d")
+            hour_str = prev_hour_time.strftime("%H")
             
-            try:
-                res_csv = requests.get(url_csv, headers=traffic_headers, timeout=4, verify=False)
-                if res_csv.status_code == 200:
-                    success_files += 1
-                    # 解析 CSV 內容並累加指定門架的車流量 (第 2 欄為 GantryID，第 5 欄為 Volume)
-                    for line in res_csv.text.strip().split('\n'):
-                        parts = line.split(',')
-                        if len(parts) >= 5:
-                            gantry_id = parts[1].strip()
-                            if gantry_id in target_gantries:
-                                target_gantries[gantry_id] += float(parts[4].strip())
-            except Exception:
-                continue
+            # 3. 呼叫 TDX 高速公路門架車流量 API (過濾霧峰段 4 個門架)
+            # 涵蓋 03F2100N, 03F2100S, 03F2125N, 03F2129S
+            filter_query = "$filter=GantryID eq '03F2100N' or GantryID eq '03F2100S' or GantryID eq '03F2125N' or GantryID eq '03F2129S'"
+            tdx_api_url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway/{date_str}?{filter_query}&$format=JSON"
 
-        # 3. 判斷是否有成功抓到資料並計算總和
-        if success_files > 0 and sum(target_gantries.values()) > 0:
-            # 若 12 份檔案有少許遺漏 (例如抓到 11 份)，按比例等比放大補齊至 60 分鐘完整流量
-            scale_factor = 12.0 / success_files
-            v_2100N = target_gantries['03F2100N'] * scale_factor
-            v_2100S = target_gantries['03F2100S'] * scale_factor
-            v_2125N = target_gantries['03F2125N'] * scale_factor
-            v_2129S = target_gantries['03F2129S'] * scale_factor
-            
-            traffic_success = True
-            print(f"   [3/3] ✅ 成功讀取【{hh}:00 時段】({success_files}/12 份 CSV) -> 北上總和: {int(v_2100N)} 輛, 南下總和: {int(v_2100S)} 輛")
+            res_traffic = requests.get(tdx_api_url, headers=tdx_headers, timeout=6)
+
+            if res_traffic.status_code == 200:
+                traffic_data = res_traffic.json()
+                
+                # 用於累加上一小時 (HH:00) 的車流量
+                hourly_sum = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
+
+                # 解析 TDX 回傳的 JSON 陣列
+                for item in traffic_data:
+                    # 檢查資料時間是否符合上一個小時
+                    data_time = item.get('m3aData', {}).get('CollectionTime', '')
+                    if f"T{hour_str}:" in data_time or f" {hour_str}:" in data_time:
+                        gantry_id = item.get('GantryID')
+                        volume = item.get('m3aData', {}).get('TrafficVolume', 0)
+                        if gantry_id in hourly_sum:
+                            hourly_sum[gantry_id] += float(volume)
+
+                # 4. 賦值結果
+                if sum(hourly_sum.values()) > 0:
+                    v_2100N = hourly_sum['03F2100N']
+                    v_2100S = hourly_sum['03F2100S']
+                    v_2125N = hourly_sum['03F2125N']
+                    v_2129S = hourly_sum['03F2129S']
+                    traffic_success = True
+                    print(f"   [3/3] ✅ 成功透過 TDX API 取得【{hour_str}:00 時段】車流量 -> 北上: {int(v_2100N)} 輛, 南下: {int(v_2100S)} 輛")
 
     except Exception as e:
-        print(f"   [3/3] ℹ️ 讀取上小時 M03A 資料夾失敗: {e}")
+        print(f"   [3/3] ℹ️ TDX API 呼叫失敗: {e}")
 
-    # 保底機制 1：若線上抓取失敗 (如 Streamlit Cloud 被擋 IP)，從 SQLite 資料庫復原
+    # 第一備援：SQLite 資料庫
     if not traffic_success:
         try:
             import sqlite3
@@ -234,11 +242,11 @@ def fetch_wufeng_live_features():
                 v_2129S = float(df_db["03F2129S"].iloc[0])
                 if v_2100N > 0 and v_2100S > 0:
                     traffic_success = True
-                    print(f"   [3/3] ✅ 從 SQLite 資料庫備援復原車流數據 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+                    print(f"   [3/3] ✅ 成功從 SQLite 復原歷史車流 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
         except Exception:
             pass
 
-    # 保底機制 2：最終動態預估保底 (避免寫死固定值)
+    # 第二備援：動態估計保底
     if not traffic_success or (v_2100N <= 0 and v_2100S <= 0):
         base_val = 1200 if 7 <= now.hour <= 19 else 400
         v_2100N = float(base_val + (now.hour % 5) * 35)
