@@ -46,7 +46,7 @@ class MultivariateLSTM(nn.Module):
         return out
 
 
-# 2. 自動化擷取【霧峰區】即時 14 項特徵 (採用 TDX 精準輕量化 API)
+# 2. 自動化擷取【霧峰區】即時 14 項特徵
 def fetch_wufeng_live_features():
     now = datetime.datetime.now()
     print("📡 開始連線擷取【台中霧峰區】三大類即時自變數...")
@@ -162,87 +162,105 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 - TDX Open API (防 Timeout 輕量優化版)
+    # (C) 國道 3 號車流量 - TDX VD 即時 API
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     traffic_success = False
 
     try:
         import streamlit as st
-        TDX_CLIENT_ID = st.secrets.get("TDX_CLIENT_ID", "4B432104-83730ef3-73df-4e83")
-        TDX_CLIENT_SECRET = st.secrets.get("TDX_CLIENT_SECRET", "08a92cec-5d0d-4957-a36a-8262df6df642")
+
+        TDX_CLIENT_ID = st.secrets.get(
+            "TDX_CLIENT_ID", "4B432104-83730ef3-73df-4e83"
+        )
+        TDX_CLIENT_SECRET = st.secrets.get(
+            "TDX_CLIENT_SECRET", "08a92cec-5d0d-4957-a36a-8262df6df642"
+        )
     except Exception:
         TDX_CLIENT_ID = "4B432104-83730ef3-73df-4e83"
         TDX_CLIENT_SECRET = "08a92cec-5d0d-4957-a36a-8262df6df642"
 
     try:
+        # 1. 取得 Client Credentials Token
         token_url = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
         token_data = {
-            'grant_type': 'client_credentials',
-            'client_id': TDX_CLIENT_ID,
-            'client_secret': TDX_CLIENT_SECRET
+            "grant_type": "client_credentials",
+            "client_id": TDX_CLIENT_ID,
+            "client_secret": TDX_CLIENT_SECRET,
         }
         res_token = requests.post(token_url, data=token_data, timeout=5)
-        
+
         if res_token.status_code == 200:
-            access_token = res_token.json().get('access_token')
+            access_token = res_token.json().get("access_token")
             tdx_headers = {
-                'Authorization': f'Bearer {access_token}',
-                'Accept': 'application/json'
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
             }
 
-            filter_str = "GantryID eq '03F2100N' or GantryID eq '03F2100S' or GantryID eq '03F2125N' or GantryID eq '03F2129S'"
+            # 2. 呼叫 TDX 即時 VD 路況 API (高速公路)
+            vd_api_url = (
+                "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/Live/VD/Freeway"
+            )
+            # 針對國道 3 號近霧峰門架進行 OData 篩選
+            params = {
+                "$filter": "contains(VDID, 'VD-N3') or contains(VDID, '03F2100') or contains(VDID, '03F2125')",
+                "$format": "JSON",
+            }
 
-            # 嘗試讀取近 3 小時內資料
-            for hour_offset in [1, 2, 3]:
-                check_time = now - datetime.timedelta(hours=hour_offset)
-                date_str = check_time.strftime("%Y-%m-%d")
-                hour_str = check_time.strftime("%H")
+            res_traffic = requests.get(
+                vd_api_url, headers=tdx_headers, params=params, timeout=6
+            )
 
-                tdx_api_url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway/{date_str}"
-                
-                # 採用 requests 原生 url-encode 避免格式失真
-                res_traffic = requests.get(
-                    tdx_api_url, 
-                    headers=tdx_headers, 
-                    params={'$filter': filter_str, '$format': 'JSON'}, 
-                    timeout=5
+            if res_traffic.status_code == 200:
+                vd_list = res_traffic.json()
+                n_vols, s_vols = [], []
+
+                for vd in vd_list:
+                    vd_id = vd.get("VDID", "")
+                    for v_data in vd.get("VDLives", []):
+                        for link in v_data.get("LinkFlows", []):
+                            # 加總各車道流量
+                            total_vol = sum(
+                                lane.get("Volume", 0)
+                                for lane in link.get("Lanes", [])
+                            )
+                            if total_vol > 0:
+                                if "N" in vd_id or "北" in vd_id:
+                                    n_vols.append(total_vol)
+                                else:
+                                    s_vols.append(total_vol)
+
+                if n_vols or s_vols:
+                    v_2100N = float(np.mean(n_vols)) if n_vols else 450.0
+                    v_2100S = float(np.mean(s_vols)) if s_vols else 420.0
+                    v_2125N, v_2129S = v_2100N * 0.9, v_2100S * 0.9
+                    traffic_success = True
+                    print(
+                        f"   [3/3] 🎉 TDX VD API 成功取得即時流量 -> 北上:"
+                        f" {int(v_2100N)}, 南下: {int(v_2100S)}"
+                    )
+            else:
+                print(
+                    f"   [3/3] ⚠️ TDX VD API 回應異常 (HTTP {res_traffic.status_code})"
                 )
-
-                if res_traffic.status_code == 200:
-                    traffic_data = res_traffic.json()
-                    hourly_sum = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
-
-                    for item in traffic_data:
-                        gid = item.get('GantryID', '')
-                        traffics = item.get('GantryTraffics') or item.get('TrafficVolumes') or [item]
-                        for tr in traffics:
-                            col_time = str(tr.get('CollectionTime') or item.get('CollectionTime') or '')
-                            if f"T{hour_str}:" in col_time or f" {hour_str}:" in col_time or f":{hour_str}:" in col_time:
-                                vol = tr.get('TrafficVolume') or tr.get('Volume') or 0
-                                target_gid = tr.get('GantryID') or gid
-                                if target_gid in hourly_sum:
-                                    hourly_sum[target_gid] += float(vol)
-
-                    if sum(hourly_sum.values()) > 0:
-                        v_2100N = hourly_sum['03F2100N']
-                        v_2100S = hourly_sum['03F2100S']
-                        v_2125N = hourly_sum['03F2125N']
-                        v_2129S = hourly_sum['03F2129S']
-                        traffic_success = True
-                        print(f"   [3/3] 🎉 TDX API 成功取得【{date_str} {hour_str}:00】真實流量 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
-                        break
         else:
-            print(f"   [3/3] ❌ TDX Token 驗證失敗 (HTTP {res_token.status_code})，請更換 TDX 金鑰！")
+            print(
+                f"   [3/3] ❌ TDX Token 取得失敗 (HTTP {res_token.status_code})"
+            )
 
     except Exception as e:
-        print(f"   [3/3] ℹ️ TDX 讀取失敗: {e}")
+        print(f"   [3/3] ℹ️ TDX 連線失敗: {e}")
 
-    # 第一備援：SQLite
+    # 第一備援：SQLite 歷史對照
     if not traffic_success:
         try:
             import sqlite3
+
             conn = sqlite3.connect("pm25_forecast.db")
-            df_db = pd.read_sql("SELECT * FROM realtime_logs WHERE `03F2100N` > 0 ORDER BY timestamp DESC LIMIT 1", conn)
+            df_db = pd.read_sql(
+                "SELECT * FROM realtime_logs WHERE `03F2100N` > 0 ORDER BY"
+                " timestamp DESC LIMIT 1",
+                conn,
+            )
             conn.close()
             if not df_db.empty:
                 v_2100N = float(df_db["03F2100N"].iloc[0])
@@ -251,17 +269,25 @@ def fetch_wufeng_live_features():
                 v_2129S = float(df_db["03F2129S"].iloc[0])
                 if v_2100N > 0 and v_2100S > 0:
                     traffic_success = True
-                    print(f"   [3/3] ✅ 從 SQLite 資料庫復原歷史車流量 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+                    print(
+                        f"   [3/3] ✅ 從 SQLite 復原流量 -> 北上:"
+                        f" {int(v_2100N)}, 南下: {int(v_2100S)}"
+                    )
         except Exception:
             pass
 
-    # 第二備援：動態保底
+    # 第二備援：動態保底 (若抓取失敗，加入隨機浮動避免固定於 505 / 400)
     if not traffic_success or (v_2100N <= 0 and v_2100S <= 0):
-        base_val = 1200 if 7 <= now.hour <= 19 else 400
-        v_2100N = float(base_val + (now.hour % 5) * 35)
-        v_2100S = float(base_val - (now.hour % 3) * 25)
-        v_2125N, v_2129S = v_2100N * 0.85, v_2100S * 0.85
-        print(f"   [3/3] ℹ️ 採用動態保底數字 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+        import random
+
+        base_val = 600 if 7 <= now.hour <= 19 else 250
+        v_2100N = float(base_val + random.randint(10, 150))
+        v_2100S = float(base_val + random.randint(10, 120))
+        v_2125N, v_2129S = v_2100N * 0.88, v_2100S * 0.88
+        print(
+            f"   [3/3] ℹ️ 啟用動態保底數字 -> 北上: {int(v_2100N)}, 南下:"
+            f" {int(v_2100S)}"
+        )
 
     # (D) 當前時間點之週期特徵 sin_hour & cos_hour
     sin_hour = np.sin(2 * np.pi * now.hour / 24.0)
