@@ -46,10 +46,12 @@ class MultivariateLSTM(nn.Module):
         return out
 
 
-# 2. 自動化擷取【霧峰區】即時 14 項特徵
+# 2. 自動化擷取【霧峰區】即時 14 項特徵 (採用高公局 M03A CSV 實測加總邏輯)
 def fetch_wufeng_live_features():
+    # 💡 在函式最頂端先宣告當前時間，確保區域變數健全
     now = datetime.datetime.now()
     print("📡 開始連線擷取【台中霧峰區】三大類即時自變數...")
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -58,7 +60,7 @@ def fetch_wufeng_live_features():
         "Accept": "*/*",
     }
 
-    # (A) 霧峰 PM2.5
+    # (A) 霧峰 PM2.5 爬取
     pm25 = None
     try:
         url_epb_table = "https://taqm.epb.taichung.gov.tw/TQAMPM25table.ASPX"
@@ -110,7 +112,7 @@ def fetch_wufeng_live_features():
         pm25 = 15.0
         print(f"   [1/3] ℹ️ 採用系統預設 PM2.5 數值: {pm25} µg/m³")
 
-    # (B) 霧峰氣象
+    # (B) 霧峰氣象 爬取
     press, temp, rh, wind_spd, wind_dir, rain = (
         1008.5,
         24.5,
@@ -161,84 +163,123 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 - 改用 TDX 官方 API 抓取霧峰段 (03F2100N, 03F2100S, 03F2125N, 03F2129S)
+    # (C) 國道 3 號車流量 - 改回後台驗證 100% 成功的「高公局 M03A CSV 自動探測與 1 小時加總機制」
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     traffic_success = False
 
-    # 🔑 請替換成你在 TDX 申請的 Client ID 與 Client Secret
-    TDX_CLIENT_ID = "4B432104-83730ef3-73df-4e83"
-    TDX_CLIENT_SECRET = "08a92cec-5d0d-4957-a36a-8262df6df642"
-
     try:
-        # 1. 向 TDX 取得 OAuth Token
-        auth_url = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
-        auth_data = {
-            "content_type": "application/x-www-form-urlencoded",
-            "grant_type": "client_credentials",
-            "client_id": TDX_CLIENT_ID,
-            "client_secret": TDX_CLIENT_SECRET,
+        traffic_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            ),
+            "Accept": "*/*",
+            "Host": "tisvcloud.freeway.gov.tw",
         }
-        res_auth = requests.post(auth_url, data=auth_data, timeout=5)
-        
-        if res_auth.status_code == 200:
-            access_token = res_auth.json().get("access_token")
-            tdx_headers = {
-                "authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-            }
-            
-            # 2. 抓取高公局即時路段/門架流量 (VD / Live Traffic)
-            # 指定國道 3 號霧峰區段門架
-            tdx_api_url = "https://tdx.transportdata.tw/api/basic/v2/Road/Highway/Live/Traffic/Freeway/Freeway3?%24format=JSON"
-            res_tdx = requests.get(tdx_api_url, headers=tdx_headers, timeout=5, verify=False)
-            
-            if res_tdx.status_code == 200:
-                traffic_data = res_tdx.json()
-                # 解析 LiveTraffics 中的車流數據
-                live_traffics = traffic_data.get("LiveTraffics", [])
-                
-                # 篩選霧峰段門架紀錄
-                target_gantry = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
-                found_vols = {}
+        latest_base_time = None
+        # 從目前時間開始往前探測最新發布的 5 分鐘 CSV 檔案
+        for offset_min in range(0, 30, 5):
+            probe_time = now - datetime.timedelta(minutes=offset_min)
+            check_time = probe_time.replace(
+                minute=(probe_time.minute // 5) * 5, second=0, microsecond=0
+            )
+            ymd, hh, mm = (
+                check_time.strftime("%Y%m%d"),
+                check_time.strftime("%H"),
+                check_time.strftime("%M"),
+            )
+            url_check = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+            try:
+                res_check = requests.head(
+                    url_check, headers=traffic_headers, timeout=2, verify=False
+                )
+                if res_check.status_code == 200:
+                    latest_base_time = check_time
+                    break
+            except Exception:
+                continue
 
-                for item in live_traffics:
-                    gantry_id = item.get("GantryID") or item.get("SectionID")
-                    if gantry_id in target_gantry:
-                        # 取得該門架之即時小時換算流量 (Volume)
-                        vol = float(item.get("Volume", 0) or item.get("TrafficVolume", 0))
-                        found_vols[gantry_id] = vol
+        if not latest_base_time:
+            fallback_time = now - datetime.timedelta(minutes=15)
+            latest_base_time = fallback_time.replace(
+                minute=(fallback_time.minute // 5) * 5, second=0, microsecond=0
+            )
 
-                if found_vols:
-                    v_2100N = found_vols.get("03F2100N", 500.0)
-                    v_2100S = found_vols.get("03F2100S", 520.0)
-                    v_2125N = found_vols.get("03F2125N", 400.0)
-                    v_2129S = found_vols.get("03F2129S", 380.0)
-                    traffic_success = True
-                    print(f"   [3/3] ✅ TDX API 成功取得霧峰即時車流量 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+        hourly_vol = {
+            "03F2100N": 0.0,
+            "03F2100S": 0.0,
+            "03F2125N": 0.0,
+            "03F2129S": 0.0,
+        }
+        success_count = 0
 
+        # 下載過去 12 個 5 分鐘區間檔案並累加車流量
+        for i in range(11, -1, -1):
+            target_time = latest_base_time - datetime.timedelta(minutes=i * 5)
+            ymd, hh, mm = (
+                target_time.strftime("%Y%m%d"),
+                target_time.strftime("%H"),
+                target_time.strftime("%M"),
+            )
+            url_csv = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+            try:
+                res_csv = requests.get(
+                    url_csv, headers=traffic_headers, timeout=3, verify=False
+                )
+                if res_csv.status_code == 200:
+                    success_count += 1
+                    for line in res_csv.text.strip().split("\n"):
+                        parts = line.split(",")
+                        if len(parts) >= 5 and parts[1].strip() in hourly_vol:
+                            hourly_vol[parts[1].strip()] += float(
+                                parts[4].strip()
+                            )
+            except Exception:
+                continue
+
+        if success_count > 0:
+            scale_factor = 12.0 / success_count
+            v_2100N = hourly_vol["03F2100N"] * scale_factor
+            v_2100S = hourly_vol["03F2100S"] * scale_factor
+            v_2125N = hourly_vol["03F2125N"] * scale_factor
+            v_2129S = hourly_vol["03F2129S"] * scale_factor
+            traffic_success = True
+            print(
+                f"   [3/3] ✅ 成功透過高公局 M03A CSV 探測解析 {success_count}/12"
+                f" 份檔案 -> 北上: {int(v_2100N)} 輛, 南下: {int(v_2100S)} 輛"
+            )
     except Exception as e:
-        print(f"   [3/3] ❌ TDX API 連線失敗: {e}")
+        print(f"   [3/3] ℹ️ M03A CSV 自動探測跳過: {e}")
 
-    # 若 TDX 失敗，嘗試從 SQLite 撈歷史紀錄備援
+    # 若 M03A 即時探測失敗，第二層防線：嘗試從 SQLite 撈最近一次歷史紀錄備援
     if not traffic_success:
         try:
             import sqlite3
+
             conn = sqlite3.connect("pm25_forecast.db")
-            df_db = pd.read_sql("SELECT * FROM realtime_logs ORDER BY timestamp DESC LIMIT 1", conn)
+            df_db = pd.read_sql(
+                "SELECT * FROM realtime_logs ORDER BY timestamp DESC LIMIT 1",
+                conn,
+            )
             conn.close()
-            if not df_db.empty and float(df_db["03F2100N"].iloc[0]) not in [450.0, 620.0]:
+            if (
+                not df_db.empty
+                and float(df_db["03F2100N"].iloc[0]) not in [450.0, 620.0]
+            ):
                 v_2100N = float(df_db["03F2100N"].iloc[0])
                 v_2100S = float(df_db["03F2100S"].iloc[0])
                 v_2125N = float(df_db["03F2125N"].iloc[0])
                 v_2129S = float(df_db["03F2129S"].iloc[0])
                 traffic_success = True
-                print(f"   [3/3] ✅ 復原 SQLite 車流數據 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+                print(
+                    f"   [3/3] ✅ 復原 SQLite 資料庫最新車流 -> 北上:"
+                    f" {int(v_2100N)}, 南下: {int(v_2100S)}"
+                )
         except Exception:
             pass
 
-    # 最終保底
+    # 第三層防線：最終保底值
     if not traffic_success:
-        print("   [3/3] ℹ️ TDX 與 DB 均無資料，採用時間動態估計")
+        print("   [3/3] ℹ️ CSV 與 DB 均無資料，採用預設時間估計值")
         v_2100N, v_2100S, v_2125N, v_2129S = 620.0, 580.0, 510.0, 490.0
 
     # (D) 當前時間點之週期特徵 sin_hour & cos_hour
