@@ -163,16 +163,21 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 - TDX 官方 Open API 版 (支援 Streamlit 雲端連線)
+    # (C) 國道 3 號車流量 - TDX 官方 Open API (結構完全修正版)
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     traffic_success = False
 
-    # 🔑 請填入你在 TDX 平台申請的憑證
-    TDX_CLIENT_ID = "4B432104-83730ef3-73df-4e83"       # 請替換為你的 Client ID
-    TDX_CLIENT_SECRET = "08a92cec-5d0d-4957-a36a-8262df6df642" # 請替換為你的 Client Secret
+    # 🔑 請填入你的 TDX 金鑰 (或於 Streamlit Secrets 設定)
+    try:
+        import streamlit as st
+        TDX_CLIENT_ID = st.secrets.get("TDX_CLIENT_ID", "4B432104-83730ef3-73df-4e83")
+        TDX_CLIENT_SECRET = st.secrets.get("TDX_CLIENT_SECRET", "08a92cec-5d0d-4957-a36a-8262df6df642")
+    except Exception:
+        TDX_CLIENT_ID = 4B432104-83730ef3-73df-4e83"
+        TDX_CLIENT_SECRET = "08a92cec-5d0d-4957-a36a-8262df6df642"
 
     try:
-        # 1. 取得 TDX 存取權限 Token
+        # 1. 取得 TDX OAuth 2.0 Token
         token_url = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
         token_data = {
             'grant_type': 'client_credentials',
@@ -188,13 +193,12 @@ def fetch_wufeng_live_features():
                 'Accept': 'application/json'
             }
 
-            # 2. 計算上一個小時的時間範圍 ( format: YYYY-MM-DDTHH:00:00 )
+            # 2. 推算上一小時的時間
             prev_hour_time = now - datetime.timedelta(hours=1)
             date_str = prev_hour_time.strftime("%Y-%m-%d")
             hour_str = prev_hour_time.strftime("%H")
-            
-            # 3. 呼叫 TDX 高速公路門架車流量 API (過濾霧峰段 4 個門架)
-            # 涵蓋 03F2100N, 03F2100S, 03F2125N, 03F2129S
+
+            # 3. 呼叫 TDX 國道門架歷史流量 API
             filter_query = "$filter=GantryID eq '03F2100N' or GantryID eq '03F2100S' or GantryID eq '03F2125N' or GantryID eq '03F2129S'"
             tdx_api_url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway/{date_str}?{filter_query}&$format=JSON"
 
@@ -202,31 +206,39 @@ def fetch_wufeng_live_features():
 
             if res_traffic.status_code == 200:
                 traffic_data = res_traffic.json()
-                
-                # 用於累加上一小時 (HH:00) 的車流量
                 hourly_sum = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
 
-                # 解析 TDX 回傳的 JSON 陣列
+                # 4. 精準解析 TDX 多層 JSON 結構
                 for item in traffic_data:
-                    # 檢查資料時間是否符合上一個小時
-                    data_time = item.get('m3aData', {}).get('CollectionTime', '')
-                    if f"T{hour_str}:" in data_time or f" {hour_str}:" in data_time:
-                        gantry_id = item.get('GantryID')
-                        volume = item.get('m3aData', {}).get('TrafficVolume', 0)
-                        if gantry_id in hourly_sum:
-                            hourly_sum[gantry_id] += float(volume)
+                    gantry_id = item.get('GantryID')
+                    
+                    # 處理不同的 TDX JSON 回傳層級
+                    traffics = item.get('GantryTraffics', []) or item.get('TrafficVolumes', []) or [item]
+                    for tr in traffics:
+                        col_time = str(tr.get('CollectionTime', '')) or str(item.get('CollectionTime', ''))
+                        # 比對時間是否包含上一個小時 (例如 T10: 或 10:)
+                        if f"T{hour_str}:" in col_time or f" {hour_str}:" in col_time:
+                            vol = tr.get('TrafficVolume') or tr.get('Volume') or 0
+                            target_gid = tr.get('GantryID') or gantry_id
+                            if target_gid in hourly_sum:
+                                hourly_sum[target_gid] += float(vol)
 
-                # 4. 賦值結果
                 if sum(hourly_sum.values()) > 0:
                     v_2100N = hourly_sum['03F2100N']
                     v_2100S = hourly_sum['03F2100S']
                     v_2125N = hourly_sum['03F2125N']
                     v_2129S = hourly_sum['03F2129S']
                     traffic_success = True
-                    print(f"   [3/3] ✅ 成功透過 TDX API 取得【{hour_str}:00 時段】車流量 -> 北上: {int(v_2100N)} 輛, 南下: {int(v_2100S)} 輛")
+                    print(f"   [3/3] 🎉 TDX API 成功取得【{hour_str}:00】真實車流 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+                else:
+                    print(f"   [3/3] ⚠️ TDX 成功連線，但時段 T{hour_str} 無對應車流數據")
+            else:
+                print(f"   [3/3] ❌ TDX API 回傳異常 HTTP 代碼: {res_traffic.status_code}")
+        else:
+            print(f"   [3/3] 🔑 TDX Token 取得失敗，請檢查 ID / Secret 是否正確 (HTTP {res_token.status_code})")
 
     except Exception as e:
-        print(f"   [3/3] ℹ️ TDX API 呼叫失敗: {e}")
+        print(f"   [3/3] ℹ️ TDX 流程異常: {e}")
 
     # 第一備援：SQLite 資料庫
     if not traffic_success:
@@ -242,7 +254,7 @@ def fetch_wufeng_live_features():
                 v_2129S = float(df_db["03F2129S"].iloc[0])
                 if v_2100N > 0 and v_2100S > 0:
                     traffic_success = True
-                    print(f"   [3/3] ✅ 成功從 SQLite 復原歷史車流 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+                    print(f"   [3/3] ✅ 從 SQLite 資料庫備援復原 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
         except Exception:
             pass
 
