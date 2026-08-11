@@ -245,7 +245,7 @@ def main():
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
             st.warning(
-                f"⚠️ 即時 API 暫時無回應，切換至 [{traffic_range_str}] 動態備援數據"
+                f"⚠️ 即時 API 暫時無回應 ({e})，切換至 [{traffic_range_str}] 動態備援數據"
             )
             live_features_list = get_fallback_features(prev_hour)
 
