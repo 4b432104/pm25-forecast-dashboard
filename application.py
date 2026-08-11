@@ -48,6 +48,7 @@ class MultivariateLSTM(nn.Module):
 
 # 2. 自動化擷取【霧峰區】即時 14 項特徵
 def fetch_wufeng_live_features():
+    now = datetime.datetime.now()
     print("📡 開始連線擷取【台中霧峰區】三大類即時自變數...")
     headers = {
         "User-Agent": (
