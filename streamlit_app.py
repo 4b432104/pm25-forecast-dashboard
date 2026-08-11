@@ -45,8 +45,6 @@ def dynamic_predict_24h(current_hour, live_features_list):
     target_col = "pm25"
 
     pm25_idx = feature_cols.index("pm25")
-    sin_idx = feature_cols.index("sin_hour")
-    cos_idx = feature_cols.index("cos_hour")
 
     # 讀取歷史數據檔建立 Scaler 與 24小時日變化 Profile
     csv_path = "dataset_for_lstm.csv"
@@ -68,7 +66,7 @@ def dynamic_predict_24h(current_hour, live_features_list):
     df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
     df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
 
-    # 💡 計算 24 小時歷史平均 Profile (計算各小時的氣象與車流趨勢)
+    # 計算 24 小時歷史平均 Profile
     hourly_profile = df_history.groupby("hour")[feature_cols].mean()
 
     train_end = int(len(df_history) * 0.7)
@@ -120,13 +118,10 @@ def dynamic_predict_24h(current_hour, live_features_list):
 
         target_h = future_time.hour
 
-        # 💡 動態更新下一個小時的所有特徵 (氣象、車流量日變化)，不再死板固定！
+        # 動態更新下一個小時的所有特徵 (帶入歷史 Profile)
         next_feature = hourly_profile.loc[target_h].values.copy()
-
-        # 保持 PM2.5 來自模型的最新預測值
         next_feature[pm25_idx] = pred_pm25
 
-        # 更新下一小時的滾動矩陣
         rolling_window = np.vstack([rolling_window[1:], next_feature])
 
     df_result = pd.DataFrame(
@@ -135,8 +130,8 @@ def dynamic_predict_24h(current_hour, live_features_list):
     return df_result
 
 
-def get_fallback_features(current_hour):
-    """當 API 暫時連不上時，優先從 SQLite 資料庫讀取最後成功紀錄；若 DB 無紀錄則從歷史 Profiles 取得動態平均值"""
+def get_fallback_features(prev_hour):
+    """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 歷史 Profile)"""
     try:
         conn = sqlite3.connect("pm25_forecast.db")
         df_db = pd.read_sql(
@@ -164,7 +159,6 @@ def get_fallback_features(current_hour):
     except Exception:
         pass
 
-    # 若 DB 讀取失敗，讀取歷史 dataset 算當前小時的 mean
     csv_path = "dataset_for_lstm.csv"
     if os.path.exists(csv_path):
         df_history = pd.read_csv(csv_path)
@@ -195,11 +189,10 @@ def get_fallback_features(current_hour):
             "sin_hour",
             "cos_hour",
         ]
-        target_h = current_hour.hour
+        target_h = prev_hour.hour
         profile = df_history.groupby("hour")[feature_cols].mean()
         return profile.loc[target_h].values.tolist()
 
-    # 預防性備援預設值
     return [
         1008.0,
         28.0,
@@ -210,7 +203,7 @@ def get_fallback_features(current_hour):
         0.0,
         10.0,
         450.0,
-        420.0,
+        480.0,
         460.0,
         430.0,
         0.0,
@@ -221,56 +214,66 @@ def get_fallback_features(current_hour):
 def main():
     st.title("🌬️ 台中市霧峰區 PM2.5 未來 24 小時預測系統")
     st.caption(
-        "結合大氣氣象、即時環測與國道 3 號車流量之 LSTM"
-        " 深度學習趨勢預測儀表板"
+        "結合大氣氣象、即時環測與國道 3 號車流量之 LSTM 深度學習趨勢預測儀表板"
     )
 
     st.sidebar.header("⚙️ 系統狀態與設定")
     if st.sidebar.button("🔄 刷新即時監測數據"):
         st.rerun()
 
-    # 1. 精準抓取當前台灣時間 (動態基準時間)
+    # 1. 精準計算【基準時間】與【前一小時車流區間】
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
-    current_hour = now.replace(minute=0, second=0, microsecond=0)
+
+    current_hour = now.replace(minute=0, second=0, microsecond=0)  # 例如 10:00
+    prev_hour = current_hour - datetime.timedelta(hours=1)  # 例如 09:00
+
     current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
+    prev_time_str = prev_hour.strftime("%H:00")
+    traffic_range_str = f"{prev_time_str} ~ {current_hour.strftime('%H:00')}"
 
     st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
+    st.sidebar.write(f"🚗 **車流統計區間**: {traffic_range_str}")
 
-    # 2. 抓取即時監測特徵
+    # 2. 擷取即時監測與前一小時數據
     live_features_list = [0.0] * 14
-    with st.spinner("📡 正在擷取霧峰即時監測數據..."):
+    with st.spinner(
+        f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."
+    ):
         try:
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
             st.warning(
-                f"⚠️ 即時 API 暫時無回應，切換至動態備援數據 (DB/歷史 Profile): {e}"
+                f"⚠️ 即時 API 暫時無回應，切換至 [{traffic_range_str}] 動態備援數據: {e}"
             )
-            live_features_list = get_fallback_features(current_hour)
+            live_features_list = get_fallback_features(prev_hour)
 
-    # 計算國道 3 號關鍵門架流量 (北上 03F2100N 與 南下 03F2100S)
-    traffic_north = live_features_list[8]
-    traffic_south = live_features_list[9]
-    traffic_total = traffic_north + traffic_south
+    # 💡 提取「北上」、「南下」與「總流量」
+    traffic_north = live_features_list[8]  # 門架 03F2100N (北上)
+    traffic_south = live_features_list[9]  # 門架 03F2100S (南下)
+    traffic_total = traffic_north + traffic_south  # 雙向總車流量
 
-    # 3. 即時數據 Summary
-    st.subheader("📊 即時監測數據 Summary")
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    # 3. 即時數據 Summary (呈現北上、南下與總車流量)
+    st.subheader(f"📊 即時監測與車流 Summary ({traffic_range_str} 累積值)")
+
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("即時 PM2.5", f"{live_features_list[7]:.1f} µg/m³")
     col2.metric("氣溫", f"{live_features_list[1]:.1f} ℃")
     col3.metric("相對濕度", f"{live_features_list[2]:.0f} %")
     col4.metric("風速", f"{live_features_list[3]:.1f} m/s")
-    col5.metric("國道 3 號 (北上)", f"{int(traffic_north)} 輛/時")
-    col6.metric("國道 3 號 (雙向總流量)", f"{int(traffic_total)} 輛/時")
+
+    st.markdown("##### 🚗 國道 3 號霧峰段車流量統計")
+    col_t1, col_t2, col_t3 = st.columns(3)
+    col_t1.metric("國道 3 號 (北上總和)", f"{int(traffic_north):,} 輛")
+    col_t2.metric("國道 3 號 (南下總和)", f"{int(traffic_south):,} 輛")
+    col_t3.metric("國道 3 號 (雙向總流量)", f"{int(traffic_total):,} 輛")
 
     st.markdown("---")
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
-    # 4. 強制以【當前基準時間】為起點，動態計算未來完整的 24 小時預測
-    with st.spinner(
-        "🔮 正在根據最新基準時間即時計算未來 24 小時趨勢..."
-    ):
+    # 4. 以【當前基準時間】推論未來 24 小時
+    with st.spinner("🔮 正在根據最新基準時間即時計算未來 24 小時趨勢..."):
         try:
             df_pred = dynamic_predict_24h(current_hour, live_features_list)
         except Exception as e:
@@ -283,7 +286,7 @@ def main():
 
     fig = go.Figure()
 
-    # 基準時間實測點 (紅點：位於最左邊 X 軸起點)
+    # 基準時間實測點
     fig.add_trace(
         go.Scatter(
             x=[current_hour_naive],
@@ -294,7 +297,7 @@ def main():
         )
     )
 
-    # 未來 24 小時預測折線 (藍線：從基準時間延伸到隔天)
+    # 未來 24 小時預測折線
     fig.add_trace(
         go.Scatter(
             x=df_pred["target_datetime"],
@@ -320,7 +323,6 @@ def main():
         annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
     )
 
-    # 嚴格設定 X 軸範圍：最左邊是當前整點，最右邊是 +24 小時
     fig.update_layout(
         xaxis=dict(
             title="預測時間點",
@@ -340,9 +342,7 @@ def main():
     st.subheader("📋 未來 24 小時預測數值明細")
     df_display = pd.DataFrame(
         {
-            "預測時間點": df_pred["target_datetime"].dt.strftime(
-                "%m/%d %H:00"
-            ),
+            "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
             "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
         }
     )
