@@ -163,66 +163,64 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 - 嚴格防 0 漏洞版
+    # (C) 國道 3 號車流量 - 精準讀取「上一個完整小時」M03A 資料夾
     v_2100N, v_2100S, v_2125N, v_2129S = 0.0, 0.0, 0.0, 0.0
     traffic_success = False
 
     try:
+        # 1. 取得上一個完整小時的時間物件 (自動處理跨日與跨月)
+        prev_hour_time = now - datetime.timedelta(hours=1)
+        ymd = prev_hour_time.strftime("%Y%m%d")
+        hh = prev_hour_time.strftime("%H")
+
+        print(f"   [3/3] 📡 開始抓取高公局 M03A 資料夾【{ymd}/{hh}】整點 1 小時完整流量...")
+
         traffic_headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept': '*/*',
             'Referer': 'https://tisvcloud.freeway.gov.tw/',
             'Connection': 'keep-alive'
         }
-        
-        latest_base_time = None
-        for offset_min in range(0, 40, 5):
-            probe_time = now - datetime.timedelta(minutes=offset_min)
-            check_time = probe_time.replace(minute=(probe_time.minute // 5) * 5, second=0, microsecond=0)
-            ymd, hh, mm = check_time.strftime("%Y%m%d"), check_time.strftime("%H"), check_time.strftime("%M")
-            url_check = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+
+        # 準備存放門架流量累計的字典
+        target_gantries = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
+        success_files = 0
+
+        # 2. 迴圈讀取該小時資料夾內的 12 個 5 分鐘 CSV 檔案 (00, 05, 10, ..., 55 分)
+        for mm_int in range(0, 60, 5):
+            mm = f"{mm_int:02d}"
+            url_csv = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
             
             try:
-                res_check = requests.get(url_check, headers=traffic_headers, timeout=3, verify=False, stream=True)
-                if res_check.status_code == 200:
-                    latest_base_time = check_time
-                    break
+                res_csv = requests.get(url_csv, headers=traffic_headers, timeout=4, verify=False)
+                if res_csv.status_code == 200:
+                    success_files += 1
+                    # 解析 CSV 內容並累加指定門架的車流量 (第 2 欄為 GantryID，第 5 欄為 Volume)
+                    for line in res_csv.text.strip().split('\n'):
+                        parts = line.split(',')
+                        if len(parts) >= 5:
+                            gantry_id = parts[1].strip()
+                            if gantry_id in target_gantries:
+                                target_gantries[gantry_id] += float(parts[4].strip())
             except Exception:
                 continue
 
-        if latest_base_time:
-            hourly_vol = {'03F2100N': 0.0, '03F2100S': 0.0, '03F2125N': 0.0, '03F2129S': 0.0}
-            success_count = 0
-
-            for i in range(11, -1, -1):
-                target_time = latest_base_time - datetime.timedelta(minutes=i*5)
-                ymd, hh, mm = target_time.strftime("%Y%m%d"), target_time.strftime("%H"), target_time.strftime("%M")
-                url_csv = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
-                try:
-                    res_csv = requests.get(url_csv, headers=traffic_headers, timeout=4, verify=False)
-                    if res_csv.status_code == 200:
-                        success_count += 1
-                        for line in res_csv.text.strip().split('\n'):
-                            parts = line.split(',')
-                            if len(parts) >= 5 and parts[1].strip() in hourly_vol:
-                                hourly_vol[parts[1].strip()] += float(parts[4].strip())
-                except Exception:
-                    continue
-
-            if success_count > 0 and sum(hourly_vol.values()) > 0:
-                scale_factor = 12.0 / success_count
-                v_2100N = hourly_vol['03F2100N'] * scale_factor
-                v_2100S = hourly_vol['03F2100S'] * scale_factor
-                v_2125N = hourly_vol['03F2125N'] * scale_factor
-                v_2129S = hourly_vol['03F2129S'] * scale_factor
-                traffic_success = True
-                print(f"   [3/3] ✅ 成功解析高公局 CSV ({success_count}/12 份) -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+        # 3. 判斷是否有成功抓到資料並計算總和
+        if success_files > 0 and sum(target_gantries.values()) > 0:
+            # 若 12 份檔案有少許遺漏 (例如抓到 11 份)，按比例等比放大補齊至 60 分鐘完整流量
+            scale_factor = 12.0 / success_files
+            v_2100N = target_gantries['03F2100N'] * scale_factor
+            v_2100S = target_gantries['03F2100S'] * scale_factor
+            v_2125N = target_gantries['03F2125N'] * scale_factor
+            v_2129S = target_gantries['03F2129S'] * scale_factor
+            
+            traffic_success = True
+            print(f"   [3/3] ✅ 成功讀取【{hh}:00 時段】({success_files}/12 份 CSV) -> 北上總和: {int(v_2100N)} 輛, 南下總和: {int(v_2100S)} 輛")
 
     except Exception as e:
-        print(f"   [3/3] ℹ️ CSV 探測跳過: {e}")
+        print(f"   [3/3] ℹ️ 讀取上小時 M03A 資料夾失敗: {e}")
 
-    # 備援機制 1：從 SQLite 撈歷史資料 (增加 >0 檢查)
+    # 保底機制 1：若線上抓取失敗 (如 Streamlit Cloud 被擋 IP)，從 SQLite 資料庫復原
     if not traffic_success:
         try:
             import sqlite3
@@ -236,15 +234,18 @@ def fetch_wufeng_live_features():
                 v_2129S = float(df_db["03F2129S"].iloc[0])
                 if v_2100N > 0 and v_2100S > 0:
                     traffic_success = True
-                    print(f"   [3/3] ✅ 復原 SQLite 歷史有效數據 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+                    print(f"   [3/3] ✅ 從 SQLite 資料庫備援復原車流數據 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
         except Exception:
             pass
 
-    # 備援機制 2：終極保底（當前兩者均失效時）
+    # 保底機制 2：最終動態預估保底 (避免寫死固定值)
     if not traffic_success or (v_2100N <= 0 and v_2100S <= 0):
-        print("   [3/3] ℹ️ 無法取得有效即時數據，採用標準動態估計保底值")
-        v_2100N, v_2100S, v_2125N, v_2129S = 620.0, 580.0, 510.0, 490.0
-
+        base_val = 1200 if 7 <= now.hour <= 19 else 400
+        v_2100N = float(base_val + (now.hour % 5) * 35)
+        v_2100S = float(base_val - (now.hour % 3) * 25)
+        v_2125N, v_2129S = v_2100N * 0.85, v_2100S * 0.85
+        print(f"   [3/3] ℹ️ 採用時段動態保底值 -> 北上: {int(v_2100N)}, 南下: {int(v_2100S)}")
+        
     # (D) 當前時間點之週期特徵 sin_hour & cos_hour
     sin_hour = np.sin(2 * np.pi * now.hour / 24.0)
     cos_hour = np.cos(2 * np.pi * now.hour / 24.0)
