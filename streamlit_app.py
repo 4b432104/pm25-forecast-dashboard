@@ -345,9 +345,9 @@ def main():
             "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
         }
     )
-    df_display = df.copy()
-    df_display = df_display.astype(str)  # 強制全欄位轉為字串，解決 ArrowTypeError
-    st.dataframe(df_display, width="stretch")  # 同時順手修復了舊語法的警告
+    df_display = df_pred.copy()
+    df_display = df_display.astype(str)
+    st.dataframe(df_display, width="stretch")
 
 
 if __name__ == "__main__":
