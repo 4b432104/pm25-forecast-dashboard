@@ -22,9 +22,6 @@ st.set_page_config(
     page_icon="🌬️",
 )
 
-df = df.astype(str)
-st.dataframe(df, width="stretch")
-
 @st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
 def dynamic_predict_24h(current_hour, live_features_list):
     """根據當前動態基準時間與即時特徵，使用 LSTM 模型直接推論未來 24 小時數值"""
@@ -348,7 +345,9 @@ def main():
             "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
         }
     )
-    st.dataframe(df_display.T, use_container_width=True)
+    df_display = df.copy()
+    df_display = df_display.astype(str)  # 強制全欄位轉為字串，解決 ArrowTypeError
+    st.dataframe(df_display, width="stretch")  # 同時順手修復了舊語法的警告
 
 
 if __name__ == "__main__":
