@@ -22,6 +22,8 @@ st.set_page_config(
     page_icon="🌬️",
 )
 
+df = df.astype(str)
+st.dataframe(df, width="stretch")
 
 @st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
 def dynamic_predict_24h(current_hour, live_features_list):
