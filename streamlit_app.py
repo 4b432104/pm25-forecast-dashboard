@@ -335,7 +335,8 @@ def main():
         height=450,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    # 修復語法警告：以 width='stretch' 取代 use_container_width=True
+    st.plotly_chart(fig, width="stretch")
 
     # 6. 未來 24 小時明細表格
     st.subheader("📋 未來 24 小時預測數值明細")
@@ -345,7 +346,7 @@ def main():
             "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
         }
     )
-    df_display = df_pred.copy()
+    # 修復 NameError：直接將欄位轉字串格式顯示
     df_display = df_display.astype(str)
     st.dataframe(df_display, width="stretch")
 
