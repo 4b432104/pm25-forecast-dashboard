@@ -22,6 +22,7 @@ st.set_page_config(
     page_icon="🌬️",
 )
 
+
 @st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
 def dynamic_predict_24h(current_hour, live_features_list):
     """根據當前動態基準時間與即時特徵，使用 LSTM 模型直接推論未來 24 小時數值"""
@@ -148,7 +149,6 @@ def get_fallback_features(prev_hour):
         "cos_hour",
     ]
 
-    # 1. 嘗試從 SQLite 資料庫讀取最近一次真實紀錄
     try:
         conn = sqlite3.connect("pm25_forecast.db")
         df_db = pd.read_sql(
@@ -160,7 +160,6 @@ def get_fallback_features(prev_hour):
     except Exception:
         pass
 
-    # 2. 嘗試從歷史數據集 (dataset_for_lstm.csv) 計算該小時的平均 Profile
     csv_path = "dataset_for_lstm.csv"
     if os.path.exists(csv_path):
         try:
@@ -186,26 +185,25 @@ def get_fallback_features(prev_hour):
         except Exception:
             pass
 
-    # 3. 若以上皆失敗，回傳合理的動態預設值
     h = prev_hour.hour
     sin_h = float(np.sin(2 * np.pi * h / 24.0))
     cos_h = float(np.cos(2 * np.pi * h / 24.0))
 
     return [
-        1008.5,  # 測站氣壓
-        24.5,    # 氣溫
-        75.0,    # 相對溼度
-        1.8,     # 風速
-        0.0,     # wind_x
-        -1.0,    # wind_y
-        0.0,     # 降水量
-        15.0,    # pm25
-        620.0,   # 03F2100N
-        580.0,   # 03F2100S
-        510.0,   # 03F2125N
-        490.0,   # 03F2129S
-        sin_h,   # sin_hour
-        cos_h,   # cos_hour
+        1008.5,
+        24.5,
+        75.0,
+        1.8,
+        0.0,
+        -1.0,
+        0.0,
+        15.0,
+        620.0,
+        580.0,
+        510.0,
+        490.0,
+        sin_h,
+        cos_h,
     ]
 
 
@@ -220,12 +218,11 @@ def main():
         st.cache_data.clear()
         st.rerun()
 
-    # 1. 精準計算【基準時間】與【前一小時車流區間】
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
 
-    current_hour = now.replace(minute=0, second=0, microsecond=0)  # 例如 10:00
-    prev_hour = current_hour - datetime.timedelta(hours=1)  # 例如 09:00
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    prev_hour = current_hour - datetime.timedelta(hours=1)
 
     current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
     prev_time_str = prev_hour.strftime("%H:00")
@@ -234,7 +231,6 @@ def main():
     st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
     st.sidebar.write(f"🚗 **車流統計區間**: {traffic_range_str}")
 
-    # 2. 擷取即時監測與前一小時數據
     live_features_list = [0.0] * 14
     with st.spinner(
         f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."
@@ -248,12 +244,10 @@ def main():
             )
             live_features_list = get_fallback_features(prev_hour)
 
-    # 💡 提取「北上」、「南下」與「總流量」
-    traffic_north = live_features_list[8]  # 門架 03F2100N (北上)
-    traffic_south = live_features_list[9]  # 門架 03F2100S (南下)
-    traffic_total = traffic_north + traffic_south  # 雙向總車流量
+    traffic_north = live_features_list[8]
+    traffic_south = live_features_list[9]
+    traffic_total = traffic_north + traffic_south
 
-    # 3. 即時數據 Summary (呈現北上、南下與總車流量)
     st.subheader(f"📊 即時監測與車流 Summary ({traffic_range_str} 累積值)")
 
     col1, col2, col3, col4 = st.columns(4)
@@ -271,7 +265,6 @@ def main():
     st.markdown("---")
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
-    # 4. 以【當前基準時間】推論未來 24 小時
     with st.spinner("🔮 正在根據最新基準時間即時計算未來 24 小時趨勢..."):
         try:
             df_pred = dynamic_predict_24h(current_hour, live_features_list)
@@ -279,13 +272,11 @@ def main():
             st.error(f"❌ 模型推論發生錯誤: {e}")
             return
 
-    # 5. 繪製圖表
     current_hour_naive = current_hour.replace(tzinfo=None)
     end_time_24h = current_hour_naive + datetime.timedelta(hours=24)
 
     fig = go.Figure()
 
-    # 基準時間實測點
     fig.add_trace(
         go.Scatter(
             x=[current_hour_naive],
@@ -296,7 +287,6 @@ def main():
         )
     )
 
-    # 未來 24 小時預測折線
     fig.add_trace(
         go.Scatter(
             x=df_pred["target_datetime"],
@@ -308,7 +298,6 @@ def main():
         )
     )
 
-    # 標準參考線
     fig.add_hline(
         y=15,
         line_dash="dash",
@@ -335,19 +324,16 @@ def main():
         height=450,
     )
 
-    # 修復語法警告：以 width='stretch' 取代 use_container_width=True
     st.plotly_chart(fig, width="stretch")
 
-    # 6. 未來 24 小時明細表格
+    # 6. 未來 24 小時明細表格 (解決 PyArrow TypeError 與 NameError)
     st.subheader("📋 未來 24 小時預測數值明細")
     df_display = pd.DataFrame(
         {
             "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
-            "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
+            "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].astype(float).round(2),
         }
     )
-    # 修復 NameError：直接將欄位轉字串格式顯示
-    df_display = df_display.astype(str)
     st.dataframe(df_display, width="stretch")
 
 
