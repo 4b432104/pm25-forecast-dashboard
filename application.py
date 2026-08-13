@@ -163,7 +163,7 @@ def fetch_wufeng_live_features():
     v_2100N, v_2100S, v_2125N, v_2129S = 450.0, 480.0, 320.0, 310.0
     now = datetime.datetime.now()
 
-    print("\n--- [Traffic Debug Start] 準備抓取國道車流量 ---")
+    print("\n--- [Traffic Debug Start] 準備抓取國道車流量 ---", flush=True)
     traffic_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
