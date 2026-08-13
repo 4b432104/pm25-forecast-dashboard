@@ -17,12 +17,6 @@ os.chdir(current_dir)
 
 import application
 import db_manager
-# 強制鎖定工作目錄
-current_dir = os.path.dirname(os.path.abspath(__file__))
-os.chdir(current_dir)
-
-import application
-import db_manager
 
 st.set_page_config(
     page_title="台中霧峰 PM2.5 未來 24 小時預測系統",
