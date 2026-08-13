@@ -46,7 +46,7 @@ class MultivariateLSTM(nn.Module):
         return out
 
 
-# 2. TDX 輔助函式 (放在全域，避免縮排混亂)
+# 2. TDX 輔助函式 (獨立全域函式)
 def get_tdx_token(client_id, client_secret):
     """取得 TDX OAuth2 認證 Token"""
     auth_url = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
@@ -59,8 +59,13 @@ def get_tdx_token(client_id, client_secret):
         res = requests.post(auth_url, data=auth_data, timeout=5)
         if res.status_code == 200:
             return res.json().get("access_token")
+        else:
+            print(
+                f"   [3/3] ❌ TDX Token 請求回傳異常狀態碼: {res.status_code}",
+                flush=True,
+            )
     except Exception as e:
-        print(f"   ❌ [TDX] Token 取得失敗: {e}", flush=True)
+        print(f"   [3/3] ❌ [TDX] Token 取得失敗: {e}", flush=True)
     return None
 
 
@@ -73,40 +78,70 @@ def fetch_wufeng_traffic_tdx(
 
     token = get_tdx_token(client_id, client_secret)
     if not token:
-        print("   ⚠️ 無法取得 TDX Token，使用動態備援車流", flush=True)
+        print("   [3/3] ⚠️ 無法取得 TDX Token，使用動態備援車流", flush=True)
         return v_2100N, v_2100S, v_2125N, v_2129S
 
-    headers = {"authorization": f"Bearer {token}"}
+    headers = {
+        "authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
     target_gantries = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
 
-    # 抓取 TDX 高速公路歷史/即時門架流量 (M03A)
-    url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway?%24filter=GantryID in ({','.join([f'\'{g}\'' for g in target_gantries])})&%24top=500&%24format=JSON"
+    # 使用展平語法 build OData filter, 避免特徵字元 encode 失敗
+    filter_query = "%20or%20".join(
+        [f"GantryID%20eq%20'{g}'" for g in target_gantries]
+    )
+    url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway?$filter={filter_query}&$top=500&$format=JSON"
 
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=8)
+        print(f"   [3/3] 📡 TDX API 回應狀態碼: {res.status_code}", flush=True)
+
         if res.status_code == 200:
             data = res.json()
             hourly_vol = {g: 0.0 for g in target_gantries}
 
-            # 累加過去一小時該門架的所有流量
+            # 累加該門架的所有流量數據
             for item in data:
                 g_id = item.get("GantryID")
                 volume = item.get("Volume", 0)
                 if g_id in hourly_vol:
                     hourly_vol[g_id] += float(volume)
 
-            v_2100N = hourly_vol["03F2100N"]
-            v_2100S = hourly_vol["03F2100S"]
-            v_2125N = hourly_vol["03F2125N"]
-            v_2129S = hourly_vol["03F2129S"]
+            # 若有成功累加數值則更新，否則維持保底值
+            v_2100N = (
+                hourly_vol["03F2100N"]
+                if hourly_vol["03F2100N"] > 0
+                else v_2100N
+            )
+            v_2100S = (
+                hourly_vol["03F2100S"]
+                if hourly_vol["03F2100S"] > 0
+                else v_2100S
+            )
+            v_2125N = (
+                hourly_vol["03F2125N"]
+                if hourly_vol["03F2125N"] > 0
+                else v_2125N
+            )
+            v_2129S = (
+                hourly_vol["03F2129S"]
+                if hourly_vol["03F2129S"] > 0
+                else v_2129S
+            )
 
             print(
-                f"   [3/3] 🎉 成功由 TDX API 取得車流量: 2100N={v_2100N}, 2100S={v_2100S}",
+                f"   [3/3] 🎉 成功由 TDX API 取得車流量: 2100N={v_2100N}, 2100S={v_2100S}, 2125N={v_2125N}, 2129S={v_2129S}",
                 flush=True,
             )
-            return v_2100N, v_2100S, v_2125N, v_2129S
+        else:
+            print(
+                f"   [3/3] ⚠️ TDX 傳回非 200 狀態 ({res.status_code}): {res.text[:100]}",
+                flush=True,
+            )
+
     except Exception as e:
-        print(f"   ❌ [TDX] 擷取流量失敗: {e}", flush=True)
+        print(f"   [3/3] ❌ TDX API 連線異常: {e}", flush=True)
 
     return v_2100N, v_2100S, v_2125N, v_2129S
 
