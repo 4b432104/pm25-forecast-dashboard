@@ -3,6 +3,7 @@ import os
 import sqlite3
 import traceback
 from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -10,6 +11,12 @@ import streamlit as st
 import torch
 from sklearn.preprocessing import MinMaxScaler
 
+# 強制鎖定工作目錄
+current_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(current_dir)
+
+import application
+import db_manager
 # 強制鎖定工作目錄
 current_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(current_dir)
