@@ -1,6 +1,7 @@
 import datetime
 import os
 import sqlite3
+import traceback
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
@@ -21,6 +22,7 @@ st.set_page_config(
     layout="wide",
     page_icon="🌬️",
 )
+
 
 @st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
 def dynamic_predict_24h(current_hour, live_features_list):
@@ -130,7 +132,7 @@ def dynamic_predict_24h(current_hour, live_features_list):
 
 
 def get_fallback_features(prev_hour):
-    """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 歷史 Profile)"""
+    """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 靜態預設值)"""
     feature_cols = [
         "測站氣壓(hPa)",
         "氣溫(℃)",
@@ -156,49 +158,32 @@ def get_fallback_features(prev_hour):
         )
         conn.close()
         if not df_db.empty and all(col in df_db.columns for col in feature_cols):
+            print("   ℹ️ 成功使用 SQLite 資料庫內的最後紀錄做為備援數據")
             return df_db[feature_cols].iloc[0].tolist()
-    except Exception:
-        pass
+    except Exception as err:
+        print(f"   ⚠️ 讀取 SQLite 備援失敗: {err}")
 
-    # 2. 擷取即時監測與前一小時數據
-    live_features_list = [0.0] * 14
-    with st.spinner(
-        f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."
-    ):
-        try:
-            live_features = application.fetch_wufeng_live_features()
-            live_features_list = [float(x) for x in live_features]
-        except Exception as e:
-            # 加上 traceback 印出真正的出錯地點
-            import traceback
-
-            print(f"❌ 擷取失敗詳細原因:\n{traceback.format_exc()}")
-
-            st.warning(
-                f"⚠️ 即時 API 擷取異常 ({e})，已切換至 [{traffic_range_str}] 動態備援數據。"
-            )
-            live_features_list = get_fallback_features(prev_hour)
-
-    # 3. 若以上皆失敗，回傳合理的動態預設值
+    # 2. 若 SQLite 沒資料，回傳安全的動態預設值（解決無窮遞迴的問題）
+    print("   ℹ️ 使用靜態動態預設值做為備援數據")
     h = prev_hour.hour
     sin_h = float(np.sin(2 * np.pi * h / 24.0))
     cos_h = float(np.cos(2 * np.pi * h / 24.0))
 
     return [
         1008.5,  # 測站氣壓
-        24.5,    # 氣溫
-        75.0,    # 相對溼度
-        1.8,     # 風速
-        0.0,     # wind_x
-        -1.0,    # wind_y
-        0.0,     # 降水量
-        15.0,    # pm25
-        620.0,   # 03F2100N
-        580.0,   # 03F2100S
-        510.0,   # 03F2125N
-        490.0,   # 03F2129S
-        sin_h,   # sin_hour
-        cos_h,   # cos_hour
+        24.5,  # 氣溫
+        75.0,  # 相對溼度
+        1.8,  # 風速
+        0.0,  # wind_x
+        -1.0,  # wind_y
+        0.0,  # 降水量
+        15.0,  # pm25
+        620.0,  # 03F2100N
+        580.0,  # 03F2100S
+        510.0,  # 03F2125N
+        490.0,  # 03F2129S
+        sin_h,  # sin_hour
+        cos_h,  # cos_hour
     ]
 
 
@@ -217,8 +202,8 @@ def main():
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
 
-    current_hour = now.replace(minute=0, second=0, microsecond=0)  # 例如 10:00
-    prev_hour = current_hour - datetime.timedelta(hours=1)  # 例如 09:00
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    prev_hour = current_hour - datetime.timedelta(hours=1)
 
     current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
     prev_time_str = prev_hour.strftime("%H:00")
@@ -236,8 +221,12 @@ def main():
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
+            # 完整印出 Traceback 到 Streamlit 日誌中
+            print("\n❌ [ERROR] fetch_wufeng_live_features 執行失敗:")
+            print(traceback.format_exc())
+
             st.warning(
-                f"⚠️ 即時 API 暫時無回應 ({e})，切換至 [{traffic_range_str}] 動態備援數據"
+                f"⚠️ 即時 API 擷取異常 ({e})，已切換至 [{traffic_range_str}] 動態備援數據。"
             )
             live_features_list = get_fallback_features(prev_hour)
 
@@ -328,18 +317,18 @@ def main():
         height=450,
     )
 
-    # 修復語法警告：以 width='stretch' 取代 use_container_width=True
     st.plotly_chart(fig, width="stretch")
 
     # 6. 未來 24 小時明細表格
     st.subheader("📋 未來 24 小時預測數值明細")
     df_display = pd.DataFrame(
         {
-            "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
+            "預測時間點": df_pred["target_datetime"].dt.strftime(
+                "%m/%d %H:00"
+            ),
             "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
         }
     )
-    # 修復 NameError：直接將欄位轉字串格式顯示
     df_display = df_display.astype(str)
     st.dataframe(df_display, width="stretch")
 
