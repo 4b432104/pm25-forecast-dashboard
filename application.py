@@ -87,11 +87,13 @@ def fetch_wufeng_traffic_tdx(
     }
     target_gantries = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
 
-    # 使用展平語法 build OData filter, 避免特徵字元 encode 失敗
+    # 使用 OData 條件搜尋指定的 4 個門架
     filter_query = "%20or%20".join(
         [f"GantryID%20eq%20'{g}'" for g in target_gantries]
     )
-    url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway?$filter={filter_query}&$top=500&$format=JSON"
+
+    # 修正：更新為 TDX 官方正確的 M03A Freeway API 端點
+    url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway/Historical?$filter={filter_query}&$top=100&$format=JSON"
 
     try:
         res = requests.get(url, headers=headers, timeout=8)
@@ -101,34 +103,22 @@ def fetch_wufeng_traffic_tdx(
             data = res.json()
             hourly_vol = {g: 0.0 for g in target_gantries}
 
-            # 累加該門架的所有流量數據
+            # 累加該門架流量數據
             for item in data:
                 g_id = item.get("GantryID")
                 volume = item.get("Volume", 0)
                 if g_id in hourly_vol:
                     hourly_vol[g_id] += float(volume)
 
-            # 若有成功累加數值則更新，否則維持保底值
-            v_2100N = (
-                hourly_vol["03F2100N"]
-                if hourly_vol["03F2100N"] > 0
-                else v_2100N
-            )
-            v_2100S = (
-                hourly_vol["03F2100S"]
-                if hourly_vol["03F2100S"] > 0
-                else v_2100S
-            )
-            v_2125N = (
-                hourly_vol["03F2125N"]
-                if hourly_vol["03F2125N"] > 0
-                else v_2125N
-            )
-            v_2129S = (
-                hourly_vol["03F2129S"]
-                if hourly_vol["03F2129S"] > 0
-                else v_2129S
-            )
+            # 若有成功取得流量數據則更新，否則使用預設備援值
+            if hourly_vol["03F2100N"] > 0:
+                v_2100N = hourly_vol["03F2100N"]
+            if hourly_vol["03F2100S"] > 0:
+                v_2100S = hourly_vol["03F2100S"]
+            if hourly_vol["03F2125N"] > 0:
+                v_2125N = hourly_vol["03F2125N"]
+            if hourly_vol["03F2129S"] > 0:
+                v_2129S = hourly_vol["03F2129S"]
 
             print(
                 f"   [3/3] 🎉 成功由 TDX API 取得車流量: 2100N={v_2100N}, 2100S={v_2100S}, 2125N={v_2125N}, 2129S={v_2129S}",
