@@ -46,9 +46,74 @@ class MultivariateLSTM(nn.Module):
         return out
 
 
-# 2. 自動化擷取【霧峰區】即時 14 項特徵 (完全保留原始邏輯)
+# 2. TDX 輔助函式 (放在全域，避免縮排混亂)
+def get_tdx_token(client_id, client_secret):
+    """取得 TDX OAuth2 認證 Token"""
+    auth_url = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
+    auth_data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    try:
+        res = requests.post(auth_url, data=auth_data, timeout=5)
+        if res.status_code == 200:
+            return res.json().get("access_token")
+    except Exception as e:
+        print(f"   ❌ [TDX] Token 取得失敗: {e}", flush=True)
+    return None
+
+
+def fetch_wufeng_traffic_tdx(
+    client_id="4B432104-83730ef3-73df-4e83",
+    client_secret="08a92cec-5d0d-4957-a36a-8262df6df642",
+):
+    """從 TDX API 取得霧峰段門架流量，自動對接原 LSTM 模型格式"""
+    v_2100N, v_2100S, v_2125N, v_2129S = 450.0, 480.0, 320.0, 310.0
+
+    token = get_tdx_token(client_id, client_secret)
+    if not token:
+        print("   ⚠️ 無法取得 TDX Token，使用動態備援車流", flush=True)
+        return v_2100N, v_2100S, v_2125N, v_2129S
+
+    headers = {"authorization": f"Bearer {token}"}
+    target_gantries = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
+
+    # 抓取 TDX 高速公路歷史/即時門架流量 (M03A)
+    url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway?%24filter=GantryID in ({','.join([f'\'{g}\'' for g in target_gantries])})&%24top=500&%24format=JSON"
+
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            hourly_vol = {g: 0.0 for g in target_gantries}
+
+            # 累加過去一小時該門架的所有流量
+            for item in data:
+                g_id = item.get("GantryID")
+                volume = item.get("Volume", 0)
+                if g_id in hourly_vol:
+                    hourly_vol[g_id] += float(volume)
+
+            v_2100N = hourly_vol["03F2100N"]
+            v_2100S = hourly_vol["03F2100S"]
+            v_2125N = hourly_vol["03F2125N"]
+            v_2129S = hourly_vol["03F2129S"]
+
+            print(
+                f"   [3/3] 🎉 成功由 TDX API 取得車流量: 2100N={v_2100N}, 2100S={v_2100S}",
+                flush=True,
+            )
+            return v_2100N, v_2100S, v_2125N, v_2129S
+    except Exception as e:
+        print(f"   ❌ [TDX] 擷取流量失敗: {e}", flush=True)
+
+    return v_2100N, v_2100S, v_2125N, v_2129S
+
+
+# 3. 自動化擷取【霧峰區】即時 14 項特徵
 def fetch_wufeng_live_features():
-    print("📡 開始連線擷取【台中霧峰區】三大類即時自變數...")
+    print("📡 開始連線擷取【台中霧峰區】三大類即時自變數...", flush=True)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -75,12 +140,12 @@ def fetch_wufeng_live_features():
                 if val_str.isdigit() or re.match(r"^\d+(\.\d+)?$", val_str):
                     pm25 = float(val_str)
                     print(
-                        f"   [1/3] ✅ 精準解析成功！【臺中環保局】霧峰站即時"
-                        f" PM2.5: {pm25} µg/m³"
+                        f"   [1/3] ✅ 精準解析成功！【臺中環保局】霧峰站即時 PM2.5: {pm25} µg/m³",
+                        flush=True,
                     )
                     break
     except Exception as e:
-        print(f"   [1/3] ℹ️ 網頁爬取跳過: {e}")
+        print(f"   [1/3] ℹ️ 網頁爬取跳過: {e}", flush=True)
 
     if pm25 is None:
         try:
@@ -98,15 +163,15 @@ def fetch_wufeng_live_features():
                 if val:
                     pm25 = float(val)
                     print(
-                        "   [1/3] ✅ 採用鄰近【大里標準站】即時 PM2.5:"
-                        f" {pm25} µg/m³"
+                        f"   [1/3] ✅ 採用鄰近【大里標準站】即時 PM2.5: {pm25} µg/m³",
+                        flush=True,
                     )
         except Exception:
             pass
 
     if pm25 is None:
         pm25 = 15.0
-        print(f"   [1/3] ℹ️ 採用系統預設 PM2.5 數值: {pm25} µg/m³")
+        print(f"   [1/3] ℹ️ 採用系統預設 PM2.5 數值: {pm25} µg/m³", flush=True)
 
     # (B) 霧峰氣象
     press, temp, rh, wind_spd, wind_dir, rain = (
@@ -149,81 +214,23 @@ def fetch_wufeng_live_features():
                 rain = safe_float(station_elem["Now"].get("Precipitation"), 0.0)
 
             print(
-                f"   [2/3] ✅ 成功取得【氣象署霧峰站】氣象 (觀測時間:"
-                f" {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%"
+                f"   [2/3] ✅ 成功取得【氣象署霧峰站】氣象 (觀測時間: {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%",
+                flush=True,
             )
     except Exception as e:
-        print(f"   [2/3] ⚠️ 氣象署 API 解析失敗，採用保底數值: {e}")
+        print(
+            f"   [2/3] ⚠️ 氣象署 API 解析失敗，採用保底數值: {e}", flush=True
+        )
 
     wind_rad = np.radians(wind_dir)
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 (強制日誌診斷版)
-    def get_tdx_token(client_id, client_secret):
-    """取得 TDX OAuth2 認證 Token"""
-    auth_url = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
-    auth_data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-    }
-    try:
-        res = requests.post(auth_url, data=auth_data, timeout=5)
-        if res.status_code == 200:
-            return res.json().get("access_token")
-    except Exception as e:
-        print(f"   ❌ [TDX] Token 取得失敗: {e}", flush=True)
-    return None
+    # (C) 國道 3 號車流量 (呼叫 TDX API)
+    v_2100N, v_2100S, v_2125N, v_2129S = fetch_wufeng_traffic_tdx()
 
-
-def fetch_wufeng_traffic_tdx(
-    client_id="4B432104-83730ef3-73df-4e83", client_secret="08a92cec-5d0d-4957-a36a-8262df6df642"
-):
-    """從 TDX API 取得霧峰段門架流量，自動對接原 LSTM 模型格式"""
-    v_2100N, v_2100S, v_2125N, v_2129S = 450.0, 480.0, 320.0, 310.0
-
-    token = get_tdx_token(client_id, client_secret)
-    if not token:
-        print("   ⚠️ 無法取得 TDX Token，使用動態備援車流", flush=True)
-        return v_2100N, v_2100S, v_2125N, v_2129S
-
-    headers = {"authorization": f"Bearer {token}"}
-    target_gantries = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
-
-    # 抓取 TDX 高速公路歷史/即時門架流量 (M03A)
-    # 這裡會直接取得最近 1 小時累積數據
-    url = f"https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/M03A/Freeway?%24filter=GantryID in ({','.join([f'\'{g}\'' for g in target_gantries])})&%24top=500&%24format=JSON"
-
-    try:
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            hourly_vol = {g: 0.0 for g in target_gantries}
-
-            # 累加過去一小時該門架的所有流量 (與你原本 CSV 累加邏輯 100% 相同)
-            for item in data:
-                g_id = item.get("GantryID")
-                volume = item.get("Volume", 0)
-                if g_id in hourly_vol:
-                    hourly_vol[g_id] += float(volume)
-
-            v_2100N = hourly_vol["03F2100N"]
-            v_2100S = hourly_vol["03F2100S"]
-            v_2125N = hourly_vol["03F2125N"]
-            v_2129S = hourly_vol["03F2129S"]
-
-            print(
-                f"   [3/3] 🎉 成功由 TDX API 取得車流量: 2100N={v_2100N}, 2100S={v_2100S}",
-                flush=True,
-            )
-            return v_2100N, v_2100S, v_2125N, v_2129S
-    except Exception as e:
-        print(f"   ❌ [TDX] 擷取流量失敗: {e}", flush=True)
-
-    return v_2100N, v_2100S, v_2125N, v_2129S
-
-    # (D) 【新增】當前時間點之週期特徵 sin_hour & cos_hour
+    # (D) 【當前時間點】之週期特徵 sin_hour & cos_hour
+    now = datetime.datetime.now()
     sin_hour = np.sin(2 * np.pi * now.hour / 24.0)
     cos_hour = np.cos(2 * np.pi * now.hour / 24.0)
 
@@ -244,11 +251,15 @@ def fetch_wufeng_traffic_tdx(
         cos_hour,
     ]
 
-# 3. 主推論程式
+
+# 4. 主推論程式
 def main():
-    print("==================================================")
-    print("🚀 啟動【霧峰 PM2.5 未來 24 小時預測系統 (方案B 整合資料庫版)】")
-    print("==================================================")
+    print("==================================================", flush=True)
+    print(
+        "🚀 啟動【霧峰 PM2.5 未來 24 小時預測系統 (方案B 整合資料庫版)】",
+        flush=True,
+    )
+    print("==================================================", flush=True)
 
     db_manager.init_db()
 
@@ -301,7 +312,10 @@ def main():
     now = datetime.datetime.now()
     current_time_str = now.strftime("%Y-%m-%d %H:00")
     db_manager.save_real_data(current_time_str, live_features_list)
-    print(f"💾 已將當前時間點 ({current_time_str}) 實測資料存入 SQLite 資料庫")
+    print(
+        f"💾 已將當前時間點 ({current_time_str}) 實測資料存入 SQLite 資料庫",
+        flush=True,
+    )
 
     live_features_np = np.array(live_features_list, dtype=np.float32)
 
@@ -313,7 +327,9 @@ def main():
 
     model_path = "best_model_ExpC_Cyclic.pth"
     if not os.path.exists(model_path):
-        print(f"❌ 錯誤：找不到訓練好的權重檔 '{model_path}'！")
+        print(
+            f"❌ 錯誤：找不到訓練好的權重檔 '{model_path}'！", flush=True
+        )
         sys.exit(1)
 
     model.load_state_dict(torch.load(model_path, map_location=device))
@@ -323,7 +339,10 @@ def main():
     future_predictions = []
     predictions_to_db = []
 
-    print("\n🔮 正在執行帶有時間週期的滾動推論計算未來 24 小時 PM2.5 趨勢...\n")
+    print(
+        "\n🔮 正在執行帶有時間週期的滾動推論計算未來 24 小時 PM2.5 趨勢...\n",
+        flush=True,
+    )
 
     rolling_window = current_window.copy()
 
@@ -355,22 +374,30 @@ def main():
         rolling_window = np.vstack([rolling_window[1:], next_feature])
 
     db_manager.save_predictions(current_time_str, predictions_to_db)
-    print(f"💾 已將未來 24 小時預測值同步紀錄至 SQLite 資料庫")
+    print(
+        f"💾 已將未來 24 小時預測值同步紀錄至 SQLite 資料庫", flush=True
+    )
 
-    print("==================================================")
-    print("📊 【霧峰區未來 24 小時 PM2.5 預測趨勢報告 (方案B 週期版)】")
-    print("==================================================")
-    print(f"• 當前基準時間 : {current_time_str}")
-    print(f"• 當前實測 PM2.5 : {live_features_list[pm25_idx]:.1f} µg/m³\n")
-    print(" 時間預測點               預測 PM2.5 (µg/m³)")
-    print("--------------------------------------------------")
+    print("==================================================", flush=True)
+    print(
+        "📊 【霧峰區未來 24 小時 PM2.5 預測趨勢報告 (方案B 週期版)】",
+        flush=True,
+    )
+    print("==================================================", flush=True)
+    print(f"• 當前基準時間 : {current_time_str}", flush=True)
+    print(
+        f"• 當前實測 PM2.5 : {live_features_list[pm25_idx]:.1f} µg/m³\n",
+        flush=True,
+    )
+    print(" 時間預測點               預測 PM2.5 (µg/m³)", flush=True)
+    print("--------------------------------------------------", flush=True)
 
     for i, pred in enumerate(future_predictions):
         future_time = now + datetime.timedelta(hours=i + 1)
         time_str = future_time.strftime("%m/%d %H:00")
-        print(f" +{i+1:02d} 小時 ({time_str})  -->  {pred:.2f} µg/m³")
+        print(f" +{i+1:02d} 小時 ({time_str})  -->  {pred:.2f} µg/m³", flush=True)
 
-    print("==================================================")
+    print("==================================================", flush=True)
 
 
 if __name__ == "__main__":
