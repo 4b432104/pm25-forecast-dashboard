@@ -159,18 +159,24 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 (超時優化版)
+    # (C) 國道 3 號車流量 ( Streamlit Cloud 海外 IP 最佳化版 )
     v_2100N, v_2100S, v_2125N, v_2129S = 450.0, 480.0, 320.0, 310.0
     now = datetime.datetime.now()
 
+    # 1. 偽裝成更真實的瀏覽器 Request Header
     traffic_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "*/*",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     }
-    
+
     latest_base_time = None
-    
-    # 放大 Timeout 至 8 秒，並從 15 分鐘前開始找
+
+    # 2. 避免 HEAD 被擋，改用 GET + stream=True (僅抓 HTTP Header，不下載內文)
     for offset_min in range(15, 60, 5):
         probe_time = now - datetime.timedelta(minutes=offset_min)
         check_time = probe_time.replace(
@@ -182,20 +188,33 @@ def fetch_wufeng_live_features():
             check_time.strftime("%M"),
         )
         url_check = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
-        
+
         try:
-            # 將 timeout 改為 8 秒
-            res_check = requests.head(
-                url_check, headers=traffic_headers, timeout=8, verify=False
+            # stream=True 可以在不下載完整 CSV 的情況下快速確認狀態碼 200
+            res_check = requests.get(
+                url_check,
+                headers=traffic_headers,
+                timeout=5,
+                verify=False,
+                stream=True,
             )
             if res_check.status_code == 200:
                 latest_base_time = check_time
+                res_check.close()  # 關閉連線
                 break
-        except Exception:
+            res_check.close()
+        except Exception as err:
+            # 可以在 Cloud 日誌看到探測狀況
+            # print(f"探測車流時間點 {hh}:{mm} 失敗: {err}")
             continue
 
     if latest_base_time:
-        hourly_vol = {"03F2100N": 0.0, "03F2100S": 0.0, "03F2125N": 0.0, "03F2129S": 0.0}
+        hourly_vol = {
+            "03F2100N": 0.0,
+            "03F2100S": 0.0,
+            "03F2125N": 0.0,
+            "03F2129S": 0.0,
+        }
         success_count = 0
 
         for i in range(11, -1, -1):
@@ -206,18 +225,19 @@ def fetch_wufeng_live_features():
                 target_time.strftime("%M"),
             )
             url_csv = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
-            
+
             try:
-                # 將 timeout 改為 8 秒
                 res_csv = requests.get(
-                    url_csv, headers=traffic_headers, timeout=8, verify=False
+                    url_csv, headers=traffic_headers, timeout=5, verify=False
                 )
                 if res_csv.status_code == 200:
                     success_count += 1
                     for line in res_csv.text.strip().split("\n"):
                         parts = line.split(",")
                         if len(parts) >= 5 and parts[1].strip() in hourly_vol:
-                            hourly_vol[parts[1].strip()] += float(parts[4].strip())
+                            hourly_vol[parts[1].strip()] += float(
+                                parts[4].strip()
+                            )
             except Exception:
                 continue
 
@@ -227,6 +247,13 @@ def fetch_wufeng_live_features():
             v_2100S = hourly_vol["03F2100S"] * scale_factor
             v_2125N = hourly_vol["03F2125N"] * scale_factor
             v_2129S = hourly_vol["03F2129S"] * scale_factor
+            print(
+                f"   [3/3] ✅ 成功取得國道車流 ({success_count}/12 份 CSV)"
+            )
+        else:
+            print("   [3/3] ⚠️ 未能成功解析任何 CSV 數據，使用保底車流")
+    else:
+        print("   [3/3] ⚠️ 找不到最新的 M03A CSV 檔案，使用保底車流")
 
     # (D) 【新增】當前時間點之週期特徵 sin_hour & cos_hour
     sin_hour = np.sin(2 * np.pi * now.hour / 24.0)
