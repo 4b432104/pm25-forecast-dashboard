@@ -133,7 +133,7 @@ def dynamic_predict_24h(current_hour, live_features_list):
 
 
 def get_fallback_features(prev_hour):
-    """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 靜態預設值)"""
+    """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 靜態動態預設值)"""
     feature_cols = [
         "測站氣壓(hPa)",
         "氣溫(℃)",
@@ -159,13 +159,13 @@ def get_fallback_features(prev_hour):
         )
         conn.close()
         if not df_db.empty and all(col in df_db.columns for col in feature_cols):
-            print("   ℹ️ 成功使用 SQLite 資料庫內的最後紀錄做為備援數據")
+            print("   ℹ️ 成功使用 SQLite 資料庫內的最後紀錄做為備援數據", flush=True)
             return df_db[feature_cols].iloc[0].tolist()
     except Exception as err:
-        print(f"   ⚠️ 讀取 SQLite 備援失敗: {err}")
+        print(f"   ⚠️ 讀取 SQLite 備援失敗: {err}", flush=True)
 
-    # 2. 若 SQLite 沒資料，回傳安全的動態預設值（解決無窮遞迴的問題）
-    print("   ℹ️ 使用靜態動態預設值做為備援數據")
+    # 2. 若 SQLite 沒資料，回傳安全的動態預設值
+    print("   ℹ️ 使用靜態動態預設值做為備援數據", flush=True)
     h = prev_hour.hour
     sin_h = float(np.sin(2 * np.pi * h / 24.0))
     cos_h = float(np.cos(2 * np.pi * h / 24.0))
@@ -222,9 +222,8 @@ def main():
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
-            # 完整印出 Traceback 到 Streamlit 日誌中
-            print("\n❌ [ERROR] fetch_wufeng_live_features 執行失敗:")
-            print(traceback.format_exc())
+            print("\n❌ [ERROR] fetch_wufeng_live_features 執行失敗:", flush=True)
+            print(traceback.format_exc(), flush=True)
 
             st.warning(
                 f"⚠️ 即時 API 擷取異常 ({e})，已切換至 [{traffic_range_str}] 動態備援數據。"
@@ -333,6 +332,6 @@ def main():
     df_display = df_display.astype(str)
     st.dataframe(df_display, width="stretch")
 
-print(f"❌ 擷取失敗詳細原因:\n{traceback.format_exc()}", flush=True)
+
 if __name__ == "__main__":
     main()
