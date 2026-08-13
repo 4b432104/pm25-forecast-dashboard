@@ -332,6 +332,6 @@ def main():
     df_display = df_display.astype(str)
     st.dataframe(df_display, width="stretch")
 
-
+print(f"❌ 擷取失敗詳細原因:\n{traceback.format_exc()}", flush=True)
 if __name__ == "__main__":
     main()
