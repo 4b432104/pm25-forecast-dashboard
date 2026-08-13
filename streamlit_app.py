@@ -160,31 +160,24 @@ def get_fallback_features(prev_hour):
     except Exception:
         pass
 
-    # 2. 嘗試從歷史數據集 (dataset_for_lstm.csv) 計算該小時的平均 Profile
-    csv_path = "dataset_for_lstm.csv"
-    if os.path.exists(csv_path):
+    # 2. 擷取即時監測與前一小時數據
+    live_features_list = [0.0] * 14
+    with st.spinner(
+        f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."
+    ):
         try:
-            df_history = pd.read_csv(csv_path)
-            wind_rad = np.radians(df_history["風向(360degree)"])
-            df_history["wind_x"] = np.cos(wind_rad)
-            df_history["wind_y"] = np.sin(wind_rad)
+            live_features = application.fetch_wufeng_live_features()
+            live_features_list = [float(x) for x in live_features]
+        except Exception as e:
+            # 加上 traceback 印出真正的出錯地點
+            import traceback
 
-            if "日期" in df_history.columns:
-                df_history["hour"] = pd.to_datetime(df_history["日期"]).dt.hour
-            elif "Time" in df_history.columns:
-                df_history["hour"] = pd.to_datetime(df_history["Time"]).dt.hour
-            else:
-                df_history["hour"] = df_history.index % 24
+            print(f"❌ 擷取失敗詳細原因:\n{traceback.format_exc()}")
 
-            df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
-            df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
-
-            target_h = prev_hour.hour
-            profile = df_history.groupby("hour")[feature_cols].mean()
-            if target_h in profile.index:
-                return profile.loc[target_h].values.tolist()
-        except Exception:
-            pass
+            st.warning(
+                f"⚠️ 即時 API 擷取異常 ({e})，已切換至 [{traffic_range_str}] 動態備援數據。"
+            )
+            live_features_list = get_fallback_features(prev_hour)
 
     # 3. 若以上皆失敗，回傳合理的動態預設值
     h = prev_hour.hour
