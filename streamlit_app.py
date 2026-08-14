@@ -219,6 +219,11 @@ def main():
         f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."
     ):
         try:
+            # 💡 顯式印出 Version 標題至控制台日誌，方便部署追蹤
+            print("\n" + "=" * 50, flush=True)
+            print("🚀 【NEW VERSION 2.0】Streamlit 儀表板啟動即時預測...", flush=True)
+            print("=" * 50 + "\n", flush=True)
+
             live_features = application.fetch_wufeng_live_features()
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
