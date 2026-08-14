@@ -266,6 +266,8 @@ def fetch_wufeng_live_features():
 # 3. 主推論程式
 def main():
     print("==================================================", flush=True)
+    print("🚀 【NEW VERSION 2.0】啟動預測系統...", flush=True)
+    print("==================================================", flush=True)
     print("🚀 啟動【霧峰 PM2.5 未來 24 小時預測系統 (方案B 整合資料庫版)】", flush=True)
     print("==================================================", flush=True)
 
