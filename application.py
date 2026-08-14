@@ -23,6 +23,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 CWA_API_KEY = "CWA-F6B5F348-77D8-4EA8-8874-FBA50E6191DE"
 MOENV_API_KEY = "5ae4f1a2-b6e6-4b79-82c8-0c84d694b7a7"
 
+# Cloudflare Proxy 轉接頭網址
+CF_PROXY_URL = "https://steep-wood-cf94.4b432104.workers.dev"
+
 
 # 1. 定義 LSTM 模型架構 (input_size=14)
 class MultivariateLSTM(nn.Module):
@@ -49,7 +52,7 @@ class MultivariateLSTM(nn.Module):
 
 
 def fetch_m03a_traffic_from_freeway():
-    """從高公局 TDCS M03A 抓取上一個完整整點小時（共 12 個 5 分鐘 CSV 檔）4 個關鍵門架的累計車流量"""
+    """透過 Cloudflare Proxy 從高公局 TDCS M03A 抓取上一個完整整點小時 4 個門架累計車流量"""
     target_gantry = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
     traffic_dict = {g: 0.0 for g in target_gantry}
 
@@ -60,7 +63,10 @@ def fetch_m03a_traffic_from_freeway():
     current_hour_start = now.replace(minute=0, second=0, microsecond=0)
     prev_hour_start = current_hour_start - datetime.timedelta(hours=1)
 
-    print(f"\n🔍 [DEBUG] 開始抓取 TDCS M03A 上一個整點小時車流資料...", flush=True)
+    print(
+        f"\n🔍 [DEBUG] 開始經由 Cloudflare 抓取 TDCS M03A 車流...",
+        flush=True,
+    )
     print(
         f"   📅 目標整點時段: {prev_hour_start.strftime('%Y-%m-%d %H:00')} ~ {prev_hour_start.strftime('%H:55')}",
         flush=True,
@@ -72,22 +78,24 @@ def fetch_m03a_traffic_from_freeway():
     }
 
     success_count = 0
-
-    # 使用 session 複用連線，提升 Streamlit / 海外環境連連線穩定度
     session = requests.Session()
     session.headers.update(headers)
 
-    # 抓取該小時內的 12 個 5 分鐘檔案 (00, 05, 10, ... 55)
+    # 抓取該小時內的 12 個 5 分鐘檔案
     for minute_offset in range(0, 60, 5):
         target_dt = prev_hour_start + datetime.timedelta(minutes=minute_offset)
         ymd = target_dt.strftime("%Y%m%d")
         hh = target_dt.strftime("%H")
         mm = target_dt.strftime("%M")
 
-        url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+        # 原始高公局網址
+        freeway_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
+
+        # 改走 Cloudflare Worker Proxy 轉載
+        proxy_request_url = f"{CF_PROXY_URL}/?url={freeway_url}"
 
         try:
-            resp = session.get(url, timeout=8, verify=False)
+            resp = session.get(proxy_request_url, timeout=10, verify=False)
             if resp.status_code == 200:
                 csv_data = io.StringIO(resp.text)
                 df_temp = pd.read_csv(csv_data, header=None)
@@ -122,7 +130,6 @@ def fetch_m03a_traffic_from_freeway():
     )
 
     if success_count > 0:
-        # 若高公局資料部分延遲（例如只抓到 10/12 檔），自動按比例補齊至 1 小時等效車流量
         if success_count < 12:
             scale_factor = 12.0 / success_count
             for gantry in target_gantry:
@@ -136,7 +143,7 @@ def fetch_m03a_traffic_from_freeway():
         )
     else:
         print(
-            f"   ⚠️ [WARNING] 無法取得 TDCS CSV 資料（網路連線逾時），將採用保底預設值",
+            f"   ⚠️ [WARNING] 無法取得 TDCS CSV 資料，將採用動態離尖峰預設值保底",
             flush=True,
         )
 
@@ -266,14 +273,25 @@ def fetch_wufeng_live_features():
     wind_x = np.cos(wind_rad)
     wind_y = np.sin(wind_rad)
 
-    # (C) 國道 3 號車流量 (呼叫修復後的 TDCS M03A 抓取函式)
+    # (C) 國道 3 號車流量 (經由 Cloudflare 代理抓取)
     traffic_dict = fetch_m03a_traffic_from_freeway()
 
-    # 若完全無法抓取，才使用預設車流 (450, 480, 320, 310)
-    v_2100N = traffic_dict.get("03F2100N", 0.0) or 450.0
-    v_2100S = traffic_dict.get("03F2100S", 0.0) or 480.0
-    v_2125N = traffic_dict.get("03F2125N", 0.0) or 320.0
-    v_2129S = traffic_dict.get("03F2129S", 0.0) or 310.0
+    # 動態時間預設值 (避免完全沒有資料時數值不合理)
+    taipei_tz = ZoneInfo("Asia/Taipei")
+    now_taipei = datetime.datetime.now(taipei_tz)
+    cur_h = now_taipei.hour
+
+    if 7 <= cur_h <= 9 or 17 <= cur_h <= 19:
+        default_v = (1200.0, 1300.0, 900.0, 850.0)  # 尖峰
+    elif 23 <= cur_h or cur_h <= 5:
+        default_v = (200.0, 220.0, 150.0, 140.0)  # 離峰
+    else:
+        default_v = (650.0, 700.0, 500.0, 480.0)  # 一般
+
+    v_2100N = traffic_dict.get("03F2100N", 0.0) or default_v[0]
+    v_2100S = traffic_dict.get("03F2100S", 0.0) or default_v[1]
+    v_2125N = traffic_dict.get("03F2125N", 0.0) or default_v[2]
+    v_2129S = traffic_dict.get("03F2129S", 0.0) or default_v[3]
 
     print(f"   [3/3] ✅ 國道 3 號門架 1小時車流量總計:", flush=True)
     print(
@@ -285,11 +303,9 @@ def fetch_wufeng_live_features():
         flush=True,
     )
 
-    # (D) 當前時間點之週期特徵 sin_hour & cos_hour
-    taipei_tz = ZoneInfo("Asia/Taipei")
-    now_taipei = datetime.datetime.now(taipei_tz)
-    sin_hour = np.sin(2 * np.pi * now_taipei.hour / 24.0)
-    cos_hour = np.cos(2 * np.pi * now_taipei.hour / 24.0)
+    # (D) 當前時間點之週期特徵
+    sin_hour = np.sin(2 * np.pi * cur_h / 24.0)
+    cos_hour = np.cos(2 * np.pi * cur_h / 24.0)
 
     return [
         press,
