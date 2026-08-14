@@ -49,36 +49,37 @@ class MultivariateLSTM(nn.Module):
 
 
 def fetch_m03a_traffic_from_freeway():
-    """從高公局 TDCS M03A 抓取過去一小時（12 個 5 分鐘 CSV 檔）4 個關鍵門架的累計車流量"""
+    """從高公局 TDCS M03A 抓取上一個完整整點小時（共 12 個 5 分鐘 CSV 檔）4 個關鍵門架的累計車流量"""
     target_gantry = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
     traffic_dict = {g: 0.0 for g in target_gantry}
 
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
 
-    # 取最近一個已完成的 5 分鐘時間點 (推遲 5-10 分鐘確保高公局檔案已產出)
-    base_time = now - datetime.timedelta(minutes=10)
-    # 歸零秒數，並對齊到 5 分鐘區間 (例如 10:53 -> 10:50)
-    minute_bucket = (base_time.minute // 5) * 5
-    base_time = base_time.replace(minute=minute_bucket, second=0, microsecond=0)
+    # 取得當前時間的「上一個整點」(例如 11:38 -> 10:00)
+    current_hour_start = now.replace(minute=0, second=0, microsecond=0)
+    prev_hour_start = current_hour_start - datetime.timedelta(hours=1)
 
+    print(f"\n🔍 [DEBUG] 開始抓取 TDCS M03A 上一個整點小時車流資料...", flush=True)
     print(
-        f"\n🔍 [DEBUG] 開始抓取 TDCS M03A 5分鐘車流資料...", flush=True
-    )
-    print(
-        f"   📅 基準結束時間點: {base_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"   📅 目標整點時段: {prev_hour_start.strftime('%Y-%m-%d %H:00')} ~ {prev_hour_start.strftime('%H:55')}",
         flush=True,
     )
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+        "Accept": "*/*",
     }
 
     success_count = 0
 
-    # 往前推 12 個時段 (每 5 分鐘一個檔，共 60 分鐘)
-    for i in range(12):
-        target_dt = base_time - datetime.timedelta(minutes=i * 5)
+    # 使用 session 複用連線，提升 Streamlit / 海外環境連連線穩定度
+    session = requests.Session()
+    session.headers.update(headers)
+
+    # 抓取該小時內的 12 個 5 分鐘檔案 (00, 05, 10, ... 55)
+    for minute_offset in range(0, 60, 5):
+        target_dt = prev_hour_start + datetime.timedelta(minutes=minute_offset)
         ymd = target_dt.strftime("%Y%m%d")
         hh = target_dt.strftime("%H")
         mm = target_dt.strftime("%M")
@@ -86,9 +87,7 @@ def fetch_m03a_traffic_from_freeway():
         url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
 
         try:
-            resp = requests.get(
-                url, headers=headers, timeout=5, verify=False
-            )
+            resp = session.get(url, timeout=8, verify=False)
             if resp.status_code == 200:
                 csv_data = io.StringIO(resp.text)
                 df_temp = pd.read_csv(csv_data, header=None)
@@ -116,25 +115,28 @@ def fetch_m03a_traffic_from_freeway():
                     flush=True,
                 )
         except Exception as e:
-            print(f"   ⚠️ 連線異常 [{ymd} {hh}:{mm}]: {e}", flush=True)
+            print(f"   ⚠️ 連線逾時/異常 [{ymd} {hh}:{mm}]: {e}", flush=True)
 
     print(
         f"   📊 下載結果: 成功取得 {success_count}/12 個時段資料", flush=True
     )
 
     if success_count > 0:
-        # 如果 12 個檔案沒有全部成功（例如抓到 10 個），按照比例放大等效於 1 小時的量
+        # 若高公局資料部分延遲（例如只抓到 10/12 檔），自動按比例補齊至 1 小時等效車流量
         if success_count < 12:
             scale_factor = 12.0 / success_count
             for gantry in target_gantry:
-                traffic_dict[gantry] = round(traffic_dict[gantry] * scale_factor)
+                traffic_dict[gantry] = round(
+                    traffic_dict[gantry] * scale_factor
+                )
 
         print(
-            f"   🎉 [SUCCESS] 過去 1 小時累計車流量: {traffic_dict}", flush=True
+            f"   🎉 [SUCCESS] 上一整點小時 ({prev_hour_start.strftime('%H:00')}) 累計車流量: {traffic_dict}",
+            flush=True,
         )
     else:
         print(
-            f"   ⚠️ [WARNING] 無法取得 TDCS CSV 資料，將採用保底預設值",
+            f"   ⚠️ [WARNING] 無法取得 TDCS CSV 資料（網路連線逾時），將採用保底預設值",
             flush=True,
         )
 
@@ -444,7 +446,7 @@ def main():
         f"• 當前實測 PM2.5 : {live_features_list[pm25_idx]:.1f} µg/m³\n",
         flush=True,
     )
-    print(" 時間預測點               預測 PM2.5 (µg/m³)", flush=True)
+    print(" 時間預測點                預測 PM2.5 (µg/m³)", flush=True)
     print("--------------------------------------------------", flush=True)
 
     for i, pred in enumerate(future_predictions):
