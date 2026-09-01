@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import torch
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 
 # 強制鎖定工作目錄
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -27,55 +27,56 @@ st.set_page_config(
 
 @st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
 def dynamic_predict_24h(current_hour, live_features_list):
-    """根據當前動態基準時間與即時特徵，使用 LSTM 模型直接推論未來 24 小時數值"""
+    """根據當前動態基準時間與即時特徵，使用 Attention LSTM 模型直接推論未來 24 小時數值"""
     feature_cols = [
         "測站氣壓(hPa)",
         "氣溫(℃)",
         "相對溼度(%)",
         "風速(m/s)",
-        "wind_x",
-        "wind_y",
+        "風向(360degree)",
         "降水量(mm)",
         "pm25",
+        "pm25_diff",
+        "pm25_accel",
+        "traffic_diff",
+        "traffic_accel",
         "03F2100N",
         "03F2100S",
         "03F2125N",
         "03F2129S",
-        "sin_hour",
-        "cos_hour",
+        "hour_sin",
+        "hour_cos",
     ]
     target_col = "pm25"
 
     pm25_idx = feature_cols.index("pm25")
 
-    # 讀取歷史數據檔建立 Scaler 與 24小時日變化 Profile
+    # 讀取歷史數據檔建立 Scaler 與歷史滾動視窗
     csv_path = "dataset_for_lstm.csv"
     if not os.path.exists(csv_path):
         raise FileNotFoundError("找不到 dataset_for_lstm.csv")
 
     df_history = pd.read_csv(csv_path)
-    wind_rad = np.radians(df_history["風向(360degree)"])
-    df_history["wind_x"] = np.cos(wind_rad)
-    df_history["wind_y"] = np.sin(wind_rad)
 
-    if "日期" in df_history.columns:
-        df_history["hour"] = pd.to_datetime(df_history["日期"]).dt.hour
-    elif "Time" in df_history.columns:
-        df_history["hour"] = pd.to_datetime(df_history["Time"]).dt.hour
-    else:
-        df_history["hour"] = df_history.index % 24
+    df_history["dt"] = pd.to_datetime(
+        df_history["time"] if "time" in df_history.columns else df_history.iloc[:, 0]
+    )
+    df_history["hour"] = df_history["dt"].dt.hour
+    df_history["hour_sin"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
+    df_history["hour_cos"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
 
-    df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
-    df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
+    df_history["pm25_diff"] = df_history["pm25"].diff().fillna(0)
+    df_history["pm25_accel"] = df_history["pm25_diff"].diff().fillna(0)
+
+    traffic_sum = df_history[["03F2100N", "03F2100S", "03F2125N", "03F2129S"]].sum(axis=1)
+    df_history["traffic_diff"] = traffic_sum.diff().fillna(0)
+    df_history["traffic_accel"] = df_history["traffic_diff"].diff().fillna(0)
 
     # 計算 24 小時歷史平均 Profile
     hourly_profile = df_history.groupby("hour")[feature_cols].mean()
 
-    train_end = int(len(df_history) * 0.7)
-    df_train = df_history.iloc[:train_end]
-
-    scaler_X = MinMaxScaler().fit(df_train[feature_cols])
-    scaler_y = MinMaxScaler().fit(df_train[[target_col]])
+    scaler_X = StandardScaler().fit(df_history[feature_cols])
+    scaler_y = StandardScaler().fit(df_history[[target_col]])
 
     # 準備模型輸入視窗 (過去 23 小時 + 當前第 24 小時即時值)
     live_features_np = np.array(live_features_list, dtype=np.float32)
@@ -83,48 +84,43 @@ def dynamic_predict_24h(current_hour, live_features_list):
     rolling_window = np.vstack([recent_23, live_features_np])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = application.MultivariateLSTM(input_size=14)
+    model = application.AttentionMultiStepLSTM(
+        input_size=17, hidden_size=64, output_steps=24
+    ).to(device)
 
-    model_path = "best_model_ExpC_Cyclic.pth"
+    model_path = "best_lstm_model.pth"
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"找不到模型權重 `{model_path}`")
 
     model.load_state_dict(torch.load(model_path, map_location=device))
-    model.to(device)
     model.eval()
+
+    current_hour_naive = current_hour.replace(tzinfo=None)
+
+    # 模型直接推論 24 步
+    window_df = pd.DataFrame(rolling_window, columns=feature_cols)
+    window_scaled = scaler_X.transform(window_df)
+
+    input_tensor = (
+        torch.tensor(window_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+    )
+
+    with torch.no_grad():
+        preds_delta_scaled = model(input_tensor).cpu().numpy()[0]
+
+    base_pm25_scaled = window_scaled[-1, pm25_idx]
+    pred_y_scaled = base_pm25_scaled + preds_delta_scaled
+    preds_pm25 = scaler_y.inverse_transform(pred_y_scaled.reshape(-1, 1)).flatten()
 
     future_predictions = []
     future_times = []
 
-    current_hour_naive = current_hour.replace(tzinfo=None)
-
-    # 滾動推論未來精準 24 小時 (+1h ~ +24h)
     for step in range(1, 25):
-        window_df = pd.DataFrame(rolling_window, columns=feature_cols)
-        window_scaled = scaler_X.transform(window_df)
-
-        input_tensor = (
-            torch.tensor(window_scaled, dtype=torch.float32)
-            .unsqueeze(0)
-            .to(device)
-        )
-
-        with torch.no_grad():
-            pred_scaled = model(input_tensor).cpu().numpy()
-
-        pred_pm25 = float(scaler_y.inverse_transform(pred_scaled)[0][0])
-        future_predictions.append(round(pred_pm25, 2))
+        pred_val = max(0.0, float(preds_pm25[step - 1]))
+        future_predictions.append(round(pred_val, 2))
 
         future_time = current_hour_naive + datetime.timedelta(hours=step)
         future_times.append(future_time)
-
-        target_h = future_time.hour
-
-        # 動態更新下一個小時的所有特徵 (帶入歷史 Profile)
-        next_feature = hourly_profile.loc[target_h].values.copy()
-        next_feature[pm25_idx] = pred_pm25
-
-        rolling_window = np.vstack([rolling_window[1:], next_feature])
 
     df_result = pd.DataFrame(
         {"target_datetime": future_times, "predicted_pm25": future_predictions}
@@ -132,23 +128,26 @@ def dynamic_predict_24h(current_hour, live_features_list):
     return df_result
 
 
-def get_fallback_features(prev_hour):
+def get_fallback_features(prev_hour, df_history=None):
     """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 靜態動態預設值)"""
     feature_cols = [
         "測站氣壓(hPa)",
         "氣溫(℃)",
         "相對溼度(%)",
         "風速(m/s)",
-        "wind_x",
-        "wind_y",
+        "風向(360degree)",
         "降水量(mm)",
         "pm25",
+        "pm25_diff",
+        "pm25_accel",
+        "traffic_diff",
+        "traffic_accel",
         "03F2100N",
         "03F2100S",
         "03F2125N",
         "03F2129S",
-        "sin_hour",
-        "cos_hour",
+        "hour_sin",
+        "hour_cos",
     ]
 
     # 1. 嘗試從 SQLite 資料庫讀取最近一次真實紀錄
@@ -172,26 +171,29 @@ def get_fallback_features(prev_hour):
 
     return [
         1008.5,  # 測站氣壓
-        24.5,  # 氣溫
-        75.0,  # 相對溼度
-        1.8,  # 風速
-        0.0,  # wind_x
-        -1.0,  # wind_y
-        0.0,  # 降水量
-        15.0,  # pm25
-        620.0,  # 03F2100N
-        580.0,  # 03F2100S
-        510.0,  # 03F2125N
-        490.0,  # 03F2129S
-        sin_h,  # sin_hour
-        cos_h,  # cos_hour
+        24.5,    # 氣溫
+        75.0,    # 相對溼度
+        1.8,     # 風速
+        180.0,   # 風向
+        0.0,     # 降水量
+        15.0,    # pm25
+        0.0,     # pm25_diff
+        0.0,     # pm25_accel
+        0.0,     # traffic_diff
+        0.0,     # traffic_accel
+        620.0,   # 03F2100N
+        580.0,   # 03F2100S
+        510.0,   # 03F2125N
+        490.0,   # 03F2129S
+        sin_h,   # hour_sin
+        cos_h,   # hour_cos
     ]
 
 
 def main():
     st.title("🌬️ 台中市霧峰區 PM2.5 未來 24 小時預測系統")
     st.caption(
-        "結合大氣氣象、即時環測與國道 3 號車流量之 LSTM 深度學習趨勢預測儀表板"
+        "結合大氣氣象、即時環測與國道 3 號車流量之 Attention LSTM 深度學習趨勢預測儀表板"
     )
 
     st.sidebar.header("⚙️ 系統狀態與設定")
@@ -214,17 +216,19 @@ def main():
     st.sidebar.write(f"🚗 **車流統計區間**: {traffic_range_str}")
 
     # 2. 擷取即時監測與前一小時數據
-    live_features_list = [0.0] * 14
+    live_features_list = [0.0] * 17
     with st.spinner(
         f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."
     ):
         try:
-            # 💡 顯式印出 Version 標題至控制台日誌，方便部署追蹤
             print("\n" + "=" * 50, flush=True)
             print("🚀 【NEW VERSION 2.0】Streamlit 儀表板啟動即時預測...", flush=True)
             print("=" * 50 + "\n", flush=True)
 
-            live_features = application.fetch_wufeng_live_features()
+            csv_path = "dataset_for_lstm.csv"
+            df_history = pd.read_csv(csv_path) if os.path.exists(csv_path) else None
+
+            live_features, logs = application.fetch_wufeng_live_features(df_history)
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
             print("\n❌ [ERROR] fetch_wufeng_live_features 執行失敗:", flush=True)
@@ -235,30 +239,37 @@ def main():
             )
             live_features_list = get_fallback_features(prev_hour)
 
-    # 💡 提取「北上」、「南下」與「總流量」
-    traffic_north = live_features_list[8]  # 門架 03F2100N (北上)
-    traffic_south = live_features_list[9]  # 門架 03F2100S (南下)
-    traffic_total = traffic_north + traffic_south  # 雙向總車流量
+    # 💡 提取 4 個門架流量並計算「北上總和」、「南下總和」與「4門架全區總車流量」
+    # 特徵欄位順序: 
+    # [11]: 03F2100N, [12]: 03F2100S, [13]: 03F2125N, [14]: 03F2129S
+    gantry_2100N = live_features_list[11]
+    gantry_2100S = live_features_list[12]
+    gantry_2125N = live_features_list[13]
+    gantry_2129S = live_features_list[14]
 
-    # 3. 即時數據 Summary (呈現北上、南下與總車流量)
+    traffic_north = gantry_2100N + gantry_2125N  # 北上門架加總
+    traffic_south = gantry_2100S + gantry_2129S  # 南下門架加總
+    traffic_total = traffic_north + traffic_south  # 4 個門架雙向總流量
+
+    # 3. 即時數據 Summary
     st.subheader(f"📊 即時監測與車流 Summary ({traffic_range_str} 累積值)")
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("即時 PM2.5", f"{live_features_list[7]:.1f} µg/m³")
+    col1.metric("即時 PM2.5", f"{live_features_list[6]:.1f} µg/m³")
     col2.metric("氣溫", f"{live_features_list[1]:.1f} ℃")
     col3.metric("相對濕度", f"{live_features_list[2]:.0f} %")
     col4.metric("風速", f"{live_features_list[3]:.1f} m/s")
 
-    st.markdown("##### 🚗 國道 3 號霧峰段車流量統計")
+    st.markdown("##### 🚗 國道 3 號霧峰段總車流量統計 (4門架加總)")
     col_t1, col_t2, col_t3 = st.columns(3)
-    col_t1.metric("國道 3 號 (北上總和)", f"{int(traffic_north):,} 輛")
-    col_t2.metric("國道 3 號 (南下總和)", f"{int(traffic_south):,} 輛")
-    col_t3.metric("國道 3 號 (雙向總流量)", f"{int(traffic_total):,} 輛")
+    col_t1.metric("國道 3 號 (北上車流總和)", f"{int(traffic_north):,} 輛")
+    col_t2.metric("國道 3 號 (南下車流總和)", f"{int(traffic_south):,} 輛")
+    col_t3.metric("國道 3 號 (雙向全區總車流量)", f"{int(traffic_total):,} 輛")
 
     st.markdown("---")
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
 
-    # 4. 以【當前基準時間】推論未來 24 小時
+    # 4. 推論未來 24 小時
     with st.spinner("🔮 正在根據最新基準時間即時計算未來 24 小時趨勢..."):
         try:
             df_pred = dynamic_predict_24h(current_hour, live_features_list)
@@ -276,7 +287,7 @@ def main():
     fig.add_trace(
         go.Scatter(
             x=[current_hour_naive],
-            y=[live_features_list[7]],
+            y=[live_features_list[6]],
             mode="markers",
             name="當前實測值 (基準時間)",
             marker=dict(color="red", size=12),
@@ -322,7 +333,7 @@ def main():
         height=450,
     )
 
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
     # 6. 未來 24 小時明細表格
     st.subheader("📋 未來 24 小時預測數值明細")
@@ -335,7 +346,7 @@ def main():
         }
     )
     df_display = df_display.astype(str)
-    st.dataframe(df_display, width="stretch")
+    st.dataframe(df_display, use_container_width=True)
 
 
 if __name__ == "__main__":
