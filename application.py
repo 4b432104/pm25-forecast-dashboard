@@ -53,7 +53,7 @@ class AttentionMultiStepLSTM(nn.Module):
         return out
 
 
-# 2. 車流量專用擷取函式 (移植舊版 12 份 CSV 累加與解析邏輯，並產出 Debug Log)
+# 2. 車流量專用擷取函式 (修正：精準解析 M03A 門架真實總車流量)
 def fetch_m03a_traffic_from_freeway():
     target_gantry = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
     traffic_dict = {g: 0.0 for g in target_gantry}
@@ -83,7 +83,7 @@ def fetch_m03a_traffic_from_freeway():
     session = requests.Session()
     session.headers.update(headers)
 
-    # 抓取該整點小時內的 12 個 5 分鐘 CSV 檔案
+    # 抓取該整點小時內的 12 個 5 分鐘 M03A CSV 檔案
     for minute_offset in range(0, 60, 5):
         target_dt = prev_hour_start + datetime.timedelta(minutes=minute_offset)
         ymd = target_dt.strftime("%Y%m%d")
@@ -97,34 +97,30 @@ def fetch_m03a_traffic_from_freeway():
             resp = session.get(proxy_request_url, timeout=8, verify=False)
             if resp.status_code == 200 and len(resp.text) > 100:
                 csv_data = io.StringIO(resp.text)
-                df_temp = pd.read_csv(csv_data, header=None)
+                # 強制以字串型態讀取 CSV，避免門架字串格式失真
+                df_temp = pd.read_csv(csv_data, header=None, dtype=str)
 
                 if len(df_temp.columns) >= 5:
-                    df_temp.columns = [
-                        "TimeInterval",
-                        "GantryID",
-                        "Direction",
-                        "VehicleType",
-                        "Volume",
-                    ] + list(df_temp.columns[5:])
-                    
-                    df_wufeng = df_temp[df_temp["GantryID"].isin(target_gantry)]
+                    # 去除門架字串前後空白
+                    df_temp[1] = df_temp[1].str.strip()
+                    # 將第 5 欄 (Volume 車流量) 安全轉為數值型態
+                    df_temp[4] = pd.to_numeric(df_temp[4], errors="coerce").fillna(0)
 
-                    matched_lines = len(df_wufeng)
+                    # 針對 4 個目標門架，把所有車種 (31, 32, 41, 42, 51) 的 Volume 累加
                     for gantry in target_gantry:
-                        vol = df_wufeng[df_wufeng["GantryID"] == gantry]["Volume"].sum()
-                        traffic_dict[gantry] += float(vol)
+                        vol_sum = df_temp[df_temp[1] == gantry][4].sum()
+                        traffic_dict[gantry] += float(vol_sum)
 
                     success_count += 1
                     debug_logs.append(
-                        f"   📄 [{hh}:{mm}] 成功讀取 {len(df_temp)} 行，命中霧峰門架 {matched_lines} 筆"
+                        f"   📄 [{hh}:{mm}] M03A 成功讀取並完成全車種車流累加"
                     )
             else:
                 debug_logs.append(f"   ⚠️ 抓取失敗 [{ymd} {hh}:{mm}] HTTP {resp.status_code}")
         except Exception as e:
             debug_logs.append(f"   ⚠️ 連線異常 [{ymd} {hh}:{mm}]: {e}")
 
-    debug_logs.append(f"📊 下載結果: 成功取得 {success_count}/12 個時段 CSV 資料")
+    debug_logs.append(f"📊 下載結果: 成功取得 {success_count}/12 個時段 M03A CSV 資料")
 
     if success_count > 0:
         if success_count < 12:
@@ -133,7 +129,7 @@ def fetch_m03a_traffic_from_freeway():
                 traffic_dict[gantry] = round(traffic_dict[gantry] * scale_factor)
 
         debug_logs.append(
-            f"   🎉 [SUCCESS] 上一整點小時 ({prev_hour_start.strftime('%H:00')}) 累計總車流量: {traffic_dict}"
+            f"   🎉 [SUCCESS] 上一整點小時 ({prev_hour_start.strftime('%H:00')}) M03A 累計真實總車流量: {traffic_dict}"
         )
     else:
         debug_logs.append("   ⚠️ 無法取得 TDCS CSV 資料，將採用動態離尖峰預設值保底")
@@ -223,7 +219,7 @@ def fetch_wufeng_live_features(df_history=None):
     except Exception as e:
         debug_logs.append(f"   [2/3] ⚠️ 氣象署 API 解析失敗，採用保底數值: {e}")
 
-    # (C) 國道 3 號車流量 (採用舊版穩定邏輯)
+    # (C) 國道 3 號車流量 (採用 M03A 解析邏輯)
     traffic_dict, traffic_logs = fetch_m03a_traffic_from_freeway()
     debug_logs.extend(traffic_logs)
 
