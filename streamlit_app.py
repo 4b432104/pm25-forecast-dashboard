@@ -72,9 +72,6 @@ def dynamic_predict_24h(current_hour, live_features_list):
     df_history["traffic_diff"] = traffic_sum.diff().fillna(0)
     df_history["traffic_accel"] = df_history["traffic_diff"].diff().fillna(0)
 
-    # 計算 24 小時歷史平均 Profile
-    hourly_profile = df_history.groupby("hour")[feature_cols].mean()
-
     scaler_X = StandardScaler().fit(df_history[feature_cols])
     scaler_y = StandardScaler().fit(df_history[[target_col]])
 
@@ -128,29 +125,15 @@ def dynamic_predict_24h(current_hour, live_features_list):
     return df_result
 
 
-def get_fallback_features(prev_hour, df_history=None):
-    """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 靜態動態預設值)"""
+def get_fallback_features(prev_hour):
+    """取得前一小時 (prev_hour) 的備援數據"""
     feature_cols = [
-        "測站氣壓(hPa)",
-        "氣溫(℃)",
-        "相對溼度(%)",
-        "風速(m/s)",
-        "風向(360degree)",
-        "降水量(mm)",
-        "pm25",
-        "pm25_diff",
-        "pm25_accel",
-        "traffic_diff",
-        "traffic_accel",
-        "03F2100N",
-        "03F2100S",
-        "03F2125N",
-        "03F2129S",
-        "hour_sin",
-        "hour_cos",
+        "測站氣壓(hPa)", "氣溫(℃)", "相對溼度(%)", "風速(m/s)", "風向(360degree)",
+        "降水量(mm)", "pm25", "pm25_diff", "pm25_accel", "traffic_diff",
+        "traffic_accel", "03F2100N", "03F2100S", "03F2125N", "03F2129S",
+        "hour_sin", "hour_cos",
     ]
 
-    # 1. 嘗試從 SQLite 資料庫讀取最近一次真實紀錄
     try:
         conn = sqlite3.connect("pm25_forecast.db")
         df_db = pd.read_sql(
@@ -158,36 +141,21 @@ def get_fallback_features(prev_hour, df_history=None):
         )
         conn.close()
         if not df_db.empty and all(col in df_db.columns for col in feature_cols):
-            print("   ℹ️ 成功使用 SQLite 資料庫內的最後紀錄做為備援數據", flush=True)
-            return df_db[feature_cols].iloc[0].tolist()
+            return df_db[feature_cols].iloc[0].tolist(), ["ℹ️ 成功使用 SQLite 資料庫紀錄作為車流與氣象備援數據"]
     except Exception as err:
-        print(f"   ⚠️ 讀取 SQLite 備援失敗: {err}", flush=True)
+        pass
 
-    # 2. 若 SQLite 沒資料，回傳安全的動態預設值
-    print("   ℹ️ 使用靜態動態預設值做為備援數據", flush=True)
     h = prev_hour.hour
     sin_h = float(np.sin(2 * np.pi * h / 24.0))
     cos_h = float(np.cos(2 * np.pi * h / 24.0))
 
-    return [
-        1008.5,  # 測站氣壓
-        24.5,    # 氣溫
-        75.0,    # 相對溼度
-        1.8,     # 風速
-        180.0,   # 風向
-        0.0,     # 降水量
-        15.0,    # pm25
-        0.0,     # pm25_diff
-        0.0,     # pm25_accel
-        0.0,     # traffic_diff
-        0.0,     # traffic_accel
-        620.0,   # 03F2100N
-        580.0,   # 03F2100S
-        510.0,   # 03F2125N
-        490.0,   # 03F2129S
-        sin_h,   # hour_sin
-        cos_h,   # hour_cos
+    fallback_data = [
+        1008.5, 24.5, 75.0, 1.8, 180.0, 0.0, 15.0,
+        0.0, 0.0, 0.0, 0.0,
+        620.0, 580.0, 510.0, 490.0,
+        sin_h, cos_h
     ]
+    return fallback_data, ["ℹ️ API 連線失敗，已載入動態預設車流與氣象備援數值"]
 
 
 def main():
@@ -201,7 +169,7 @@ def main():
         st.cache_data.clear()
         st.rerun()
 
-    # 1. 精準計算【基準時間】與【前一小時車流區間】
+    # 1. 計算【基準時間】與【前一小時車流區間】
     taipei_tz = ZoneInfo("Asia/Taipei")
     now = datetime.datetime.now(taipei_tz)
 
@@ -215,43 +183,32 @@ def main():
     st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
     st.sidebar.write(f"🚗 **車流統計區間**: {traffic_range_str}")
 
-    # 2. 擷取即時監測與前一小時數據
-    live_features_list = [0.0] * 17
-    with st.spinner(
-        f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."
-    ):
+    # 2. 擷取即時數據與工作日誌
+    live_features_list = []
+    fetch_logs = []
+    with st.spinner(f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."):
         try:
-            print("\n" + "=" * 50, flush=True)
-            print("🚀 【NEW VERSION 2.0】Streamlit 儀表板啟動即時預測...", flush=True)
-            print("=" * 50 + "\n", flush=True)
-
             csv_path = "dataset_for_lstm.csv"
             df_history = pd.read_csv(csv_path) if os.path.exists(csv_path) else None
 
-            live_features, logs = application.fetch_wufeng_live_features(df_history)
+            live_features, fetch_logs = application.fetch_wufeng_live_features(df_history)
             live_features_list = [float(x) for x in live_features]
         except Exception as e:
-            print("\n❌ [ERROR] fetch_wufeng_live_features 執行失敗:", flush=True)
-            print(traceback.format_exc(), flush=True)
+            st.warning(f"⚠️ 即時 API 擷取異常 ({e})，已切換至 [{traffic_range_str}] 備援數據。")
+            live_features_list, fetch_logs = get_fallback_features(prev_hour)
 
-            st.warning(
-                f"⚠️ 即時 API 擷取異常 ({e})，已切換至 [{traffic_range_str}] 動態備援數據。"
-            )
-            live_features_list = get_fallback_features(prev_hour)
+    # 💡 解析 4 個門架獨立車流量與計算總流量
+    # 索引位置: [11]: 03F2100N, [12]: 03F2100S, [13]: 03F2125N, [14]: 03F2129S
+    g_2100N = live_features_list[11]
+    g_2100S = live_features_list[12]
+    g_2125N = live_features_list[13]
+    g_2129S = live_features_list[14]
 
-    # 💡 提取 4 個門架流量並計算「北上總和」、「南下總和」與「4門架全區總車流量」
-    # 特徵欄位順序: 
-    # [11]: 03F2100N, [12]: 03F2100S, [13]: 03F2125N, [14]: 03F2129S
-    gantry_2100N = live_features_list[11]
-    gantry_2100S = live_features_list[12]
-    gantry_2125N = live_features_list[13]
-    gantry_2129S = live_features_list[14]
+    traffic_north = g_2100N + g_2125N
+    traffic_south = g_2100S + g_2129S
+    traffic_total = traffic_north + traffic_south
 
-    traffic_north = gantry_2100N + gantry_2125N  # 北上門架加總
-    traffic_south = gantry_2100S + gantry_2129S  # 南下門架加總
-    traffic_total = traffic_north + traffic_south  # 4 個門架雙向總流量
-
-    # 3. 即時數據 Summary
+    # 3. 即時監測與車流 Summary 顯示
     st.subheader(f"📊 即時監測與車流 Summary ({traffic_range_str} 累積值)")
 
     col1, col2, col3, col4 = st.columns(4)
@@ -260,11 +217,30 @@ def main():
     col3.metric("相對濕度", f"{live_features_list[2]:.0f} %")
     col4.metric("風速", f"{live_features_list[3]:.1f} m/s")
 
-    st.markdown("##### 🚗 國道 3 號霧峰段總車流量統計 (4門架加總)")
+    st.markdown("##### 🚗 國道 3 號霧峰段車流量數據")
     col_t1, col_t2, col_t3 = st.columns(3)
-    col_t1.metric("國道 3 號 (北上車流總和)", f"{int(traffic_north):,} 輛")
-    col_t2.metric("國道 3 號 (南下車流總和)", f"{int(traffic_south):,} 輛")
-    col_t3.metric("國道 3 號 (雙向全區總車流量)", f"{int(traffic_total):,} 輛")
+    col_t1.metric("北上總車流量 (2100N + 2125N)", f"{int(traffic_north):,} 輛")
+    col_t2.metric("南下總車流量 (2100S + 2129S)", f"{int(traffic_south):,} 輛")
+    col_t3.metric("🔥 雙向全區總車流量", f"{int(traffic_total):,} 輛")
+
+    # ------------------------------------------------------------------
+    # 📝 核心新增：工作日記與每筆門架總車流量細節
+    # ------------------------------------------------------------------
+    with st.expander("📝 查看車流量抓取明細與系統工作日記 (Work Log)", expanded=False):
+        st.markdown(f"**⏰ 紀錄時間**：`{current_time_str}` | **統計時段**：`{traffic_range_str}`")
+        
+        # 門架流量明細表
+        df_traffic_log = pd.DataFrame({
+            "門架代碼": ["03F2100N (北上)", "03F2100S (南下)", "03F2125N (北上)", "03F2129S (南下)", "合計總流量"],
+            "抓取車種範疇": ["全車種 (31,32,41,42,51)", "全車種 (31,32,41,42,51)", "全車種 (31,32,41,42,51)", "全車種 (31,32,41,42,51)", "全區雙向彙整"],
+            "累積流量 (輛)": [f"{int(g_2100N):,}", f"{int(g_2100S):,}", f"{int(g_2125N):,}", f"{int(g_2129S):,}", f"👉 {int(traffic_total):,} 輛"]
+        })
+        st.table(df_traffic_log)
+
+        # 系統日誌輸出
+        st.markdown("**🔍 即時爬蟲與資料處理執行日誌：**")
+        log_text = "\n".join(fetch_logs) if fetch_logs else "尚無日誌訊息"
+        st.code(log_text, language="text")
 
     st.markdown("---")
     st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
@@ -277,13 +253,12 @@ def main():
             st.error(f"❌ 模型推論發生錯誤: {e}")
             return
 
-    # 5. 繪製圖表
+    # 5. 繪製預測折線圖
     current_hour_naive = current_hour.replace(tzinfo=None)
     end_time_24h = current_hour_naive + datetime.timedelta(hours=24)
 
     fig = go.Figure()
 
-    # 基準時間實測點
     fig.add_trace(
         go.Scatter(
             x=[current_hour_naive],
@@ -294,7 +269,6 @@ def main():
         )
     )
 
-    # 未來 24 小時預測折線
     fig.add_trace(
         go.Scatter(
             x=df_pred["target_datetime"],
@@ -306,7 +280,6 @@ def main():
         )
     )
 
-    # 標準參考線
     fig.add_hline(
         y=15,
         line_dash="dash",
@@ -335,13 +308,11 @@ def main():
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # 6. 未來 24 小時明細表格
+    # 6. 明細表格
     st.subheader("📋 未來 24 小時預測數值明細")
     df_display = pd.DataFrame(
         {
-            "預測時間點": df_pred["target_datetime"].dt.strftime(
-                "%m/%d %H:00"
-            ),
+            "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
             "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
         }
     )
