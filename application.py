@@ -1,383 +1,706 @@
 import datetime
-import io
-import os
-import re
-import sys
-import urllib3
-from zoneinfo import ZoneInfo
-from bs4 import BeautifulSoup
-import numpy as np
-import pandas as pd
-import requests
-from sklearn.preprocessing import StandardScaler
-import torch
-import torch.nn as nn
 
-# 引入 DB 操作模組
+import os
+
+import sqlite3
+
+from zoneinfo import ZoneInfo
+
+import numpy as np
+
+import pandas as pd
+
+import plotly.graph_objects as go
+
+import streamlit as st
+
+import torch
+
+from sklearn.preprocessing import MinMaxScaler
+
+
+
+# 強制鎖定工作目錄
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+os.chdir(current_dir)
+
+
+
+import application
+
 import db_manager
 
-# 關閉 SSL 憑證警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# API 金鑰設定
-CWA_API_KEY = "CWA-F6B5F348-77D8-4EA8-8874-FBA50E6191DE"
-MOENV_API_KEY = "5ae4f1a2-b6e6-4b79-82c8-0c84d694b7a7"
-
-# Cloudflare Proxy 轉接頭網址
-CF_PROXY_URL = "https://steep-wood-cf94.4b432104.workers.dev"
 
 
-# 1. 定義 Direct Multi-Step LSTM + Self-Attention 模型架構
-class AttentionMultiStepLSTM(nn.Module):
-    def __init__(self, input_size=17, hidden_size=64, num_layers=2, output_steps=24):
-        super(AttentionMultiStepLSTM, self).__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=0.1,
-        )
-        self.attn = nn.Linear(hidden_size, 1)
-        self.fc1 = nn.Linear(hidden_size, 32)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(32, output_steps)
+st.set_page_config(
 
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        attn_weights = torch.softmax(self.attn(lstm_out), dim=1)
-        context = torch.sum(attn_weights * lstm_out, dim=1)
-        out = self.fc1(context)
-        out = self.relu(out)
-        out = self.fc2(out)
-        return out
+    page_title="台中霧峰 PM2.5 未來 24 小時預測系統",
+
+    layout="wide",
+
+    page_icon="🌬️",
+
+)
 
 
-# 2. 車流量專用擷取函式 (含完整雙管道探測與調試日誌)
-def fetch_m03a_traffic_from_freeway():
-    target_gantry = ["03F2100N", "03F2100S", "03F2125N", "03F2129S"]
-    traffic_dict = {g: 0.0 for g in target_gantry}
-    debug_logs = []
-
-    taipei_tz = ZoneInfo("Asia/Taipei")
-    now = datetime.datetime.now(taipei_tz)
-
-    debug_logs.append("🚗 [車流探測] 開始向高公局伺服器探測最新 5 分鐘 CSV 車流檔案...")
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            " (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-    }
-    session = requests.Session()
-    session.headers.update(headers)
-
-    # 1. 自動探測高公局最新的 5 分鐘時間點 (嘗試近 6 個時間點)
-    latest_valid_dt = None
-    latest_channel = "直連"
-
-    for minutes_back in range(10, 40, 5):
-        test_dt = now - datetime.timedelta(minutes=minutes_back)
-        # 對齊到 5 分鐘區間
-        test_dt = test_dt.replace(minute=(test_dt.minute // 5) * 5, second=0, microsecond=0)
-        
-        ymd_str = test_dt.strftime("%Y%m%d")
-        hh_str = test_dt.strftime("%H")
-        mm_str = test_dt.strftime("%M")
-        
-        debug_logs.append(f"📡 測試時間點 {ymd_str} {hh_str}:{mm_str} ...")
-        
-        raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd_str}/{hh_str}/TDCS_M03A_{ymd_str}_{hh_str}{mm_str}00.csv"
-        proxy_url = f"{CF_PROXY_URL}/?url={raw_url}"
-
-        # 嘗試直連
-        try:
-            r_direct = session.get(raw_url, timeout=4, verify=False)
-            if r_direct.status_code == 200 and len(r_direct.text) > 500:
-                debug_logs.append(f"-> [直連] HTTP Response Status: 200, Body Length: {len(r_direct.text)} bytes")
-                latest_valid_dt = test_dt
-                latest_channel = "直連"
-                break
-        except Exception as e:
-            debug_logs.append(f"❌\n[直連] 連線異常: HTTPSConnectionPool(host='tisvcloud.freeway.gov.tw', port=443): Max retries exceeded with url: /history/TDCS/M03A/{ymd_str}/{hh_str}/TDCS_M03A_{ymd_str}_{hh_str}{mm_str}00.csv (Caused by ConnectTimeoutError(<HTTPSConnection(host='tisvcloud.freeway.gov.tw', port=443) at 0x7bfb24c0cf50>, 'Connection to tisvcloud.freeway.gov.tw timed out. (connect timeout=4)'))")
-
-        # 嘗試 Worker 代理
-        try:
-            r_proxy = session.get(proxy_url, timeout=4, verify=False)
-            if r_proxy.status_code == 200 and len(r_proxy.text) > 500:
-                debug_logs.append(f"-> [Worker代理] HTTP Response Status: 200, Body Length: {len(r_proxy.text)} bytes")
-                latest_valid_dt = test_dt
-                latest_channel = "Worker代理"
-                break
-            else:
-                debug_logs.append(f"❌\n[Worker代理] 連線異常: HTTPSConnectionPool(host='steep-wood-cf94.4b432104.workers.dev', port=443): Read timed out. (read timeout=4)")
-        except Exception as e:
-            debug_logs.append(f"❌\n[Worker代理] 連線異常: HTTPSConnectionPool(host='steep-wood-cf94.4b432104.workers.dev', port=443): Read timed out. (read timeout=4)")
-
-    if latest_valid_dt is None:
-        latest_valid_dt = now - datetime.timedelta(minutes=30)
-        latest_valid_dt = latest_valid_dt.replace(minute=(latest_valid_dt.minute // 5) * 5, second=0, microsecond=0)
-
-    debug_logs.append(f"🎯\n成功定位高公局最新車流 CSV 時間點: {latest_valid_dt.strftime('%Y%m%d %H:%M')} (管道: {latest_channel})")
-
-    # 2. 抓取過去 12 個 5 分鐘時間區間 (共計 1 小時)
-    success_count = 0
-    total_rows_scanned = 0
-
-    for i in range(11, -1, -1):
-        slot_dt = latest_valid_dt - datetime.timedelta(minutes=i * 5)
-        ymd = slot_dt.strftime("%Y%m%d")
-        hh = slot_dt.strftime("%H")
-        mm = slot_dt.strftime("%M")
-
-        raw_url = f"https://tisvcloud.freeway.gov.tw/history/TDCS/M03A/{ymd}/{hh}/TDCS_M03A_{ymd}_{hh}{mm}00.csv"
-        target_url = proxy_url if latest_channel == "Worker代理" else raw_url
-
-        try:
-            resp = session.get(target_url, timeout=8, verify=False)
-            if resp.status_code == 200 and len(resp.text) > 100:
-                csv_data = io.StringIO(resp.text)
-                df_temp = pd.read_csv(csv_data, header=None, dtype=str)
-
-                if len(df_temp.columns) >= 5:
-                    df_temp[1] = df_temp[1].str.strip()
-                    df_temp[4] = pd.to_numeric(df_temp[4], errors="coerce").fillna(0)
-
-                    row_count = len(df_temp)
-                    total_rows_scanned += row_count
-                    match_count = 0
-
-                    for gantry in target_gantry:
-                        sub_df = df_temp[df_temp[1] == gantry]
-                        match_count += len(sub_df)
-                        vol_sum = sub_df[4].sum()
-                        traffic_dict[gantry] += float(vol_sum)
-
-                    success_count += 1
-                    debug_logs.append(f"📄\n[CSV {hh}:{mm}] 讀取 {row_count} 行，匹配霧峰段門架 {match_count} 次")
-            else:
-                debug_logs.append(f"📄\n[CSV {hh}:{mm}] 下載失敗 HTTP {resp.status_code}")
-        except Exception as e:
-            debug_logs.append(f"📄\n[CSV {hh}:{mm}] 讀取異常: {e}")
-
-    debug_logs.append(f"📊 累計下載成功 {success_count}/12 份 CSV 檔，共掃描 {total_rows_scanned} 行資料。")
-    debug_logs.append(f"🔢 各門架原始實測總量 (車輛數): {traffic_dict}")
-
-    if success_count > 0 and success_count < 12:
-        scale_factor = 12.0 / success_count
-        for gantry in target_gantry:
-            traffic_dict[gantry] = round(traffic_dict[gantry] * scale_factor)
-
-    return traffic_dict, debug_logs
 
 
-# 3. 自動化擷取【霧峰區】即時 17 項特徵
-def fetch_wufeng_live_features(df_history=None):
-    debug_logs = []
-    taipei_tz = ZoneInfo("Asia/Taipei")
-    now = datetime.datetime.now(taipei_tz)
-    debug_logs.append(f"🔍 [Debug] 開始執行即時數據擷取任務，系統時間: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-    }
+@st.cache_data(ttl=3600)  # 快取 1 小時 (3600 秒)
 
-    # (A) 霧峰 PM2.5
-    pm25 = None
-    try:
-        url_epb_table = "https://taqm.epb.taichung.gov.tw/TQAMPM25table.ASPX"
-        res_epb = requests.get(url_epb_table, headers=headers, timeout=10, verify=False)
-        res_epb.encoding = "utf-8"
-        soup = BeautifulSoup(res_epb.text, "html.parser")
-        all_cells = [tag.text.strip() for tag in soup.find_all(["td", "th", "a"])]
+def dynamic_predict_24h(current_hour, live_features_list):
 
-        for idx, text in enumerate(all_cells):
-            if "霧峰" in text and idx + 1 < len(all_cells):
-                val_str = all_cells[idx + 1]
-                if val_str.isdigit() or re.match(r"^\d+(\.\d+)?$", val_str):
-                    pm25 = float(val_str)
-                    debug_logs.append(f"[1/3] ✅ 【臺中環保局】霧峰站即時 PM2.5 成功解析: {pm25} µg/m³")
-                    break
-    except Exception as e:
-        pass
-
-    if pm25 is None:
-        try:
-            url_dali = f"https://data.moenv.gov.tw/api/v2/aqx_p_432?api_key={MOENV_API_KEY}&limit=5&format=json&filters=sitename,eq,大里"
-            res_dali = requests.get(url_dali, headers=headers, timeout=10, verify=False).json()
-            recs = res_dali.get("records", []) if isinstance(res_dali, dict) else res_dali
-            if recs:
-                val = recs[0].get("pm25") or recs[0].get("pm2.5")
-                if val:
-                    pm25 = float(val)
-                    debug_logs.append(f"[1/3] ✅ 採用鄰近【大里標準站】即時 PM2.5: {pm25} µg/m³")
-        except Exception as e:
-            pass
-
-    if pm25 is None:
-        pm25 = float(df_history["pm25"].iloc[-1]) if df_history is not None else 15.0
-        debug_logs.append(f"[1/3] ⚠️ PM2.5 採用歷史/保底數值: {pm25} µg/m³")
-
-    # (B) 霧峰氣象
-    press, temp, rh, wind_spd, wind_dir, rain = 1008.5, 26.8, 91.0, 1.8, 180.0, 0.0
-    try:
-        url_cwa = f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001?Authorization={CWA_API_KEY}&StationName=霧峰"
-        res_cwa = requests.get(url_cwa, headers=headers, timeout=10, verify=False).json()
-        if isinstance(res_cwa, dict) and res_cwa.get("records") and res_cwa["records"].get("Station"):
-            station_data = res_cwa["records"]["Station"][0]
-            obs_time_str = station_data.get("ObsTime", {}).get("DateTime", f"{now.strftime('%Y-%m-%d')}T09:00:00+08:00")
-            station_elem = station_data["WeatherElement"]
-
-            def safe_float(val, default_val):
-                try:
-                    v = float(val)
-                    return default_val if v < -90 else v
-                except (ValueError, TypeError):
-                    return default_val
-
-            press = safe_float(station_elem.get("AirPressure"), press)
-            temp = safe_float(station_elem.get("AirTemperature"), temp)
-            rh = safe_float(station_elem.get("RelativeHumidity"), rh)
-            wind_spd = safe_float(station_elem.get("WindSpeed"), wind_spd)
-            wind_dir = safe_float(station_elem.get("WindDirection"), wind_dir)
-            if "Now" in station_elem and isinstance(station_elem["Now"], dict):
-                rain = safe_float(station_elem["Now"].get("Precipitation"), 0.0)
-
-            debug_logs.append(
-                f"[2/3] ✅ 成功取得【氣象署霧峰站】 (時間: {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%, 氣壓 {press}hPa"
-            )
-    except Exception as e:
-        obs_time_str = f"{now.strftime('%Y-%m-%d')}T09:00:00+08:00"
-        debug_logs.append(f"[2/3] ✅ 成功取得【氣象署霧峰站】 (時間: {obs_time_str}): 氣溫 {temp}℃, 濕度 {rh}%, 氣壓 {press}hPa")
-
-    # (C) 國道 3 號車流量 (採用 M03A 解析邏輯)
-    traffic_dict, traffic_logs = fetch_m03a_traffic_from_freeway()
-    debug_logs.extend(traffic_logs)
-
-    v_2100N = traffic_dict.get("03F2100N", 281.0)
-    v_2100S = traffic_dict.get("03F2100S", 291.0)
-    v_2125N = traffic_dict.get("03F2125N", 336.0)
-    v_2129S = traffic_dict.get("03F2129S", 399.0)
-
-    debug_logs.append(
-        f"[3/3] ✅ 車流計算完成 (等比換算一小時): 2100N={v_2100N:.0f}, 2100S={v_2100S:.0f}, 2125N={v_2125N:.0f}, 2129S={v_2129S:.0f}"
-    )
-
-    # (D) 計算一階差分、二階加速度與週期特徵
-    last_pm25 = float(df_history["pm25"].iloc[-1]) if df_history is not None else pm25
-    last_pm25_diff = float(df_history["pm25_diff"].iloc[-1]) if df_history is not None else 0.0
-    pm25_diff = pm25 - last_pm25
-    pm25_accel = pm25_diff - last_pm25_diff
-
-    current_traffic = v_2100N + v_2100S + v_2125N + v_2129S
-    last_traffic = (
-        float(df_history[["03F2100N", "03F2100S", "03F2125N", "03F2129S"]].iloc[-1].sum())
-        if df_history is not None
-        else current_traffic
-    )
-    last_traffic_diff = float(df_history["traffic_diff"].iloc[-1]) if df_history is not None else 0.0
-    traffic_diff = current_traffic - last_traffic
-    traffic_accel = traffic_diff - last_traffic_diff
-
-    cur_h = now.hour
-    hour_sin = np.sin(2 * np.pi * cur_h / 24.0)
-    hour_cos = np.cos(2 * np.pi * cur_h / 24.0)
-
-    features = [
-        press, temp, rh, wind_spd, wind_dir, rain,
-        pm25, pm25_diff, pm25_accel,
-        traffic_diff, traffic_accel,
-        v_2100N, v_2100S, v_2125N, v_2129S,
-        hour_sin, hour_cos,
-    ]
-
-    return features, debug_logs
-
-
-# 4. 主推論程式
-def main():
-    print("==================================================")
-    print("🚀 啟動【霧峰 PM2.5 未來 24 小時 Attention 多步預測系統】")
-    print("==================================================")
-
-    db_manager.init_db()
-    df_history = pd.read_csv("dataset_for_lstm.csv")
-
-    df_history["dt"] = pd.to_datetime(
-        df_history["time"] if "time" in df_history.columns else df_history.iloc[:, 0]
-    )
-    df_history["hour"] = df_history["dt"].dt.hour
-    df_history["hour_sin"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
-    df_history["hour_cos"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
-
-    df_history["pm25_diff"] = df_history["pm25"].diff().fillna(0)
-    df_history["pm25_accel"] = df_history["pm25_diff"].diff().fillna(0)
-
-    traffic_sum = df_history[["03F2100N", "03F2100S", "03F2125N", "03F2129S"]].sum(axis=1)
-    df_history["traffic_diff"] = traffic_sum.diff().fillna(0)
-    df_history["traffic_accel"] = df_history["traffic_diff"].diff().fillna(0)
+    """根據當前動態基準時間與即時特徵，使用 LSTM 模型直接推論未來 24 小時數值"""
 
     feature_cols = [
-        "測站氣壓(hPa)", "氣溫(℃)", "相對溼度(%)", "風速(m/s)", "風向(360degree)",
-        "降水量(mm)", "pm25", "pm25_diff", "pm25_accel", "traffic_diff",
-        "traffic_accel", "03F2100N", "03F2100S", "03F2125N", "03F2129S",
-        "hour_sin", "hour_cos",
+
+        "測站氣壓(hPa)",
+
+        "氣溫(℃)",
+
+        "相對溼度(%)",
+
+        "風速(m/s)",
+
+        "wind_x",
+
+        "wind_y",
+
+        "降水量(mm)",
+
+        "pm25",
+
+        "03F2100N",
+
+        "03F2100S",
+
+        "03F2125N",
+
+        "03F2129S",
+
+        "sin_hour",
+
+        "cos_hour",
+
     ]
+
     target_col = "pm25"
 
-    scaler_X = StandardScaler().fit(df_history[feature_cols])
-    scaler_y = StandardScaler().fit(df_history[[target_col]])
 
-    live_features, logs = fetch_wufeng_live_features(df_history)
-    for log in logs:
-        print(log)
 
-    live_features_list = [float(x) for x in live_features]
+    pm25_idx = feature_cols.index("pm25")
 
-    taipei_tz = ZoneInfo("Asia/Taipei")
-    now = datetime.datetime.now(taipei_tz)
-    base_time = now.replace(minute=0, second=0, microsecond=0)
-    current_time_str = base_time.strftime("%Y-%m-%d %H:00")
 
-    db_manager.save_real_data(current_time_str, live_features_list)
+
+    # 讀取歷史數據檔建立 Scaler 與 24小時日變化 Profile
+
+    csv_path = "dataset_for_lstm.csv"
+
+    if not os.path.exists(csv_path):
+
+        raise FileNotFoundError("找不到 dataset_for_lstm.csv")
+
+
+
+    df_history = pd.read_csv(csv_path)
+
+    wind_rad = np.radians(df_history["風向(360degree)"])
+
+    df_history["wind_x"] = np.cos(wind_rad)
+
+    df_history["wind_y"] = np.sin(wind_rad)
+
+
+
+    if "日期" in df_history.columns:
+
+        df_history["hour"] = pd.to_datetime(df_history["日期"]).dt.hour
+
+    elif "Time" in df_history.columns:
+
+        df_history["hour"] = pd.to_datetime(df_history["Time"]).dt.hour
+
+    else:
+
+        df_history["hour"] = df_history.index % 24
+
+
+
+    df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
+
+    df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
+
+
+
+    # 計算 24 小時歷史平均 Profile
+
+    hourly_profile = df_history.groupby("hour")[feature_cols].mean()
+
+
+
+    train_end = int(len(df_history) * 0.7)
+
+    df_train = df_history.iloc[:train_end]
+
+
+
+    scaler_X = MinMaxScaler().fit(df_train[feature_cols])
+
+    scaler_y = MinMaxScaler().fit(df_train[[target_col]])
+
+
+
+    # 準備模型輸入視窗 (過去 23 小時 + 當前第 24 小時即時值)
+
+    live_features_np = np.array(live_features_list, dtype=np.float32)
 
     recent_23 = df_history[feature_cols].iloc[-23:].values
-    current_window = np.vstack([recent_23, np.array(live_features_list, dtype=np.float32)])
 
-    window_scaled = scaler_X.transform(pd.DataFrame(current_window, columns=feature_cols))
+    rolling_window = np.vstack([recent_23, live_features_np])
+
+
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_tensor = torch.tensor(window_scaled, dtype=torch.float32).unsqueeze(0).to(device)
 
-    model = AttentionMultiStepLSTM(input_size=17, hidden_size=64, output_steps=24).to(device)
+    model = application.MultivariateLSTM(input_size=14)
 
-    model_path = "best_lstm_model.pth"
-    if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.eval()
+
+
+    model_path = "best_model_ExpC_Cyclic.pth"
+
+    if not os.path.exists(model_path):
+
+        raise FileNotFoundError(f"找不到模型權重 `{model_path}`")
+
+
+
+    model.load_state_dict(torch.load(model_path, map_location=device))
+
+    model.to(device)
+
+    model.eval()
+
+
+
+    future_predictions = []
+
+    future_times = []
+
+
+
+    current_hour_naive = current_hour.replace(tzinfo=None)
+
+
+
+    # 滾動推論未來精準 24 小時 (+1h ~ +24h)
+
+    for step in range(1, 25):
+
+        window_df = pd.DataFrame(rolling_window, columns=feature_cols)
+
+        window_scaled = scaler_X.transform(window_df)
+
+
+
+        input_tensor = (
+
+            torch.tensor(window_scaled, dtype=torch.float32)
+
+            .unsqueeze(0)
+
+            .to(device)
+
+        )
+
+
 
         with torch.no_grad():
-            preds_delta_scaled = model(input_tensor).cpu().numpy()[0]
 
-        base_pm25_scaled = window_scaled[-1, 6]
-        pred_y_scaled = base_pm25_scaled + preds_delta_scaled
-        preds_pm25 = scaler_y.inverse_transform(pred_y_scaled.reshape(-1, 1)).flatten()
+            pred_scaled = model(input_tensor).cpu().numpy()
 
-        predictions_to_db = []
-        for i, pred in enumerate(preds_pm25):
-            future_time = base_time + datetime.timedelta(hours=i + 1)
-            target_time_str = future_time.strftime("%Y-%m-%d %H:00")
-            pred_val = max(0.0, float(pred))
-            predictions_to_db.append((target_time_str, pred_val, i + 1))
 
-        db_manager.save_predictions(current_time_str, predictions_to_db)
-        print("💾 已成功將預測數值寫入 SQLite 資料庫")
+
+        pred_pm25 = float(scaler_y.inverse_transform(pred_scaled)[0][0])
+
+        future_predictions.append(round(pred_pm25, 2))
+
+
+
+        future_time = current_hour_naive + datetime.timedelta(hours=step)
+
+        future_times.append(future_time)
+
+
+
+        target_h = future_time.hour
+
+
+
+        # 動態更新下一個小時的所有特徵 (帶入歷史 Profile)
+
+        next_feature = hourly_profile.loc[target_h].values.copy()
+
+        next_feature[pm25_idx] = pred_pm25
+
+
+
+        rolling_window = np.vstack([rolling_window[1:], next_feature])
+
+
+
+    df_result = pd.DataFrame(
+
+        {"target_datetime": future_times, "predicted_pm25": future_predictions}
+
+    )
+
+    return df_result
+
+
+
+
+
+def get_fallback_features(prev_hour):
+
+    """取得前一小時 (prev_hour) 的車流與氣象備援數據 (SQLite 或 歷史 Profile)"""
+
+    feature_cols = [
+
+        "測站氣壓(hPa)",
+
+        "氣溫(℃)",
+
+        "相對溼度(%)",
+
+        "風速(m/s)",
+
+        "wind_x",
+
+        "wind_y",
+
+        "降水量(mm)",
+
+        "pm25",
+
+        "03F2100N",
+
+        "03F2100S",
+
+        "03F2125N",
+
+        "03F2129S",
+
+        "sin_hour",
+
+        "cos_hour",
+
+    ]
+
+
+
+    # 1. 嘗試從 SQLite 資料庫讀取最近一次真實紀錄
+
+    try:
+
+        conn = sqlite3.connect("pm25_forecast.db")
+
+        df_db = pd.read_sql(
+
+            "SELECT * FROM realtime_logs ORDER BY timestamp DESC LIMIT 1", conn
+
+        )
+
+        conn.close()
+
+        if not df_db.empty and all(col in df_db.columns for col in feature_cols):
+
+            return df_db[feature_cols].iloc[0].tolist()
+
+    except Exception:
+
+        pass
+
+
+
+    # 2. 嘗試從歷史數據集 (dataset_for_lstm.csv) 計算該小時的平均 Profile
+
+    csv_path = "dataset_for_lstm.csv"
+
+    if os.path.exists(csv_path):
+
+        try:
+
+            df_history = pd.read_csv(csv_path)
+
+            wind_rad = np.radians(df_history["風向(360degree)"])
+
+            df_history["wind_x"] = np.cos(wind_rad)
+
+            df_history["wind_y"] = np.sin(wind_rad)
+
+
+
+            if "日期" in df_history.columns:
+
+                df_history["hour"] = pd.to_datetime(df_history["日期"]).dt.hour
+
+            elif "Time" in df_history.columns:
+
+                df_history["hour"] = pd.to_datetime(df_history["Time"]).dt.hour
+
+            else:
+
+                df_history["hour"] = df_history.index % 24
+
+
+
+            df_history["sin_hour"] = np.sin(2 * np.pi * df_history["hour"] / 24.0)
+
+            df_history["cos_hour"] = np.cos(2 * np.pi * df_history["hour"] / 24.0)
+
+
+
+            target_h = prev_hour.hour
+
+            profile = df_history.groupby("hour")[feature_cols].mean()
+
+            if target_h in profile.index:
+
+                return profile.loc[target_h].values.tolist()
+
+        except Exception:
+
+            pass
+
+
+
+    # 3. 若以上皆失敗，回傳合理的動態預設值
+
+    h = prev_hour.hour
+
+    sin_h = float(np.sin(2 * np.pi * h / 24.0))
+
+    cos_h = float(np.cos(2 * np.pi * h / 24.0))
+
+
+
+    return [
+
+        1008.5,  # 測站氣壓
+
+        24.5,    # 氣溫
+
+        75.0,    # 相對溼度
+
+        1.8,     # 風速
+
+        0.0,     # wind_x
+
+        -1.0,    # wind_y
+
+        0.0,     # 降水量
+
+        15.0,    # pm25
+
+        620.0,   # 03F2100N
+
+        580.0,   # 03F2100S
+
+        510.0,   # 03F2125N
+
+        490.0,   # 03F2129S
+
+        sin_h,   # sin_hour
+
+        cos_h,   # cos_hour
+
+    ]
+
+
+
+
+
+def main():
+
+    st.title("🌬️ 台中市霧峰區 PM2.5 未來 24 小時預測系統")
+
+    st.caption(
+
+        "結合大氣氣象、即時環測與國道 3 號車流量之 LSTM 深度學習趨勢預測儀表板"
+
+    )
+
+
+
+    st.sidebar.header("⚙️ 系統狀態與設定")
+
+    if st.sidebar.button("🔄 刷新即時監測數據"):
+
+        st.cache_data.clear()
+
+        st.rerun()
+
+
+
+    # 1. 精準計算【基準時間】與【前一小時車流區間】
+
+    taipei_tz = ZoneInfo("Asia/Taipei")
+
+    now = datetime.datetime.now(taipei_tz)
+
+
+
+    current_hour = now.replace(minute=0, second=0, microsecond=0)  # 例如 10:00
+
+    prev_hour = current_hour - datetime.timedelta(hours=1)  # 例如 09:00
+
+
+
+    current_time_str = current_hour.strftime("%Y-%m-%d %H:00")
+
+    prev_time_str = prev_hour.strftime("%H:00")
+
+    traffic_range_str = f"{prev_time_str} ~ {current_hour.strftime('%H:00')}"
+
+
+
+    st.sidebar.write(f"🕒 **當前基準時間**: {current_time_str}")
+
+    st.sidebar.write(f"🚗 **車流統計區間**: {traffic_range_str}")
+
+
+
+    # 2. 擷取即時監測與前一小時數據
+
+    live_features_list = [0.0] * 14
+
+    with st.spinner(
+
+        f"📡 正在擷取霧峰即時監測與車流數據 ({traffic_range_str})..."
+
+    ):
+
+        try:
+
+            live_features = application.fetch_wufeng_live_features()
+
+            live_features_list = [float(x) for x in live_features]
+
+        except Exception as e:
+
+            st.warning(
+
+                f"⚠️ 即時 API 暫時無回應，切換至 [{traffic_range_str}] 動態備援數據"
+
+            )
+
+            live_features_list = get_fallback_features(prev_hour)
+
+
+
+    # 💡 提取「北上」、「南下」與「總流量」
+
+    traffic_north = live_features_list[8]  # 門架 03F2100N (北上)
+
+    traffic_south = live_features_list[9]  # 門架 03F2100S (南下)
+
+    traffic_total = traffic_north + traffic_south  # 雙向總車流量
+
+
+
+    # 3. 即時數據 Summary (呈現北上、南下與總車流量)
+
+    st.subheader(f"📊 即時監測與車流 Summary ({traffic_range_str} 累積值)")
+
+
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("即時 PM2.5", f"{live_features_list[7]:.1f} µg/m³")
+
+    col2.metric("氣溫", f"{live_features_list[1]:.1f} ℃")
+
+    col3.metric("相對濕度", f"{live_features_list[2]:.0f} %")
+
+    col4.metric("風速", f"{live_features_list[3]:.1f} m/s")
+
+
+
+    st.markdown("##### 🚗 國道 3 號霧峰段車流量統計")
+
+    col_t1, col_t2, col_t3 = st.columns(3)
+
+    col_t1.metric("國道 3 號 (北上總和)", f"{int(traffic_north):,} 輛")
+
+    col_t2.metric("國道 3 號 (南下總和)", f"{int(traffic_south):,} 輛")
+
+    col_t3.metric("國道 3 號 (雙向總流量)", f"{int(traffic_total):,} 輛")
+
+
+
+    st.markdown("---")
+
+    st.subheader("🔮 未來 24 小時 PM2.5 預測趨勢圖")
+
+
+
+    # 4. 以【當前基準時間】推論未來 24 小時
+
+    with st.spinner("🔮 正在根據最新基準時間即時計算未來 24 小時趨勢..."):
+
+        try:
+
+            df_pred = dynamic_predict_24h(current_hour, live_features_list)
+
+        except Exception as e:
+
+            st.error(f"❌ 模型推論發生錯誤: {e}")
+
+            return
+
+
+
+    # 5. 繪製圖表
+
+    current_hour_naive = current_hour.replace(tzinfo=None)
+
+    end_time_24h = current_hour_naive + datetime.timedelta(hours=24)
+
+
+
+    fig = go.Figure()
+
+
+
+    # 基準時間實測點
+
+    fig.add_trace(
+
+        go.Scatter(
+
+            x=[current_hour_naive],
+
+            y=[live_features_list[7]],
+
+            mode="markers",
+
+            name="當前實測值 (基準時間)",
+
+            marker=dict(color="red", size=12),
+
+        )
+
+    )
+
+
+
+    # 未來 24 小時預測折線
+
+    fig.add_trace(
+
+        go.Scatter(
+
+            x=df_pred["target_datetime"],
+
+            y=df_pred["predicted_pm25"],
+
+            mode="lines+markers",
+
+            name="LSTM 預測 PM2.5 (µg/m³)",
+
+            line=dict(color="#0083B0", width=3),
+
+            marker=dict(size=6),
+
+        )
+
+    )
+
+
+
+    # 標準參考線
+
+    fig.add_hline(
+
+        y=15,
+
+        line_dash="dash",
+
+        line_color="orange",
+
+        annotation_text="WHO 24小時建議值 (15 µg/m³)",
+
+    )
+
+    fig.add_hline(
+
+        y=35.5,
+
+        line_dash="dash",
+
+        line_color="red",
+
+        annotation_text="環境部橘色提醒臨界點 (35.5 µg/m³)",
+
+    )
+
+
+
+    fig.update_layout(
+
+        xaxis=dict(
+
+            title="預測時間點",
+
+            type="date",
+
+            tickformat="%m/%d %H:00",
+
+            range=[current_hour_naive, end_time_24h],
+
+        ),
+
+        yaxis_title="PM2.5 濃度 (µg/m³)",
+
+        hovermode="x unified",
+
+        margin=dict(l=20, r=20, t=30, b=20),
+
+        height=450,
+
+    )
+
+
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
+
+    # 6. 未來 24 小時明細表格
+
+    st.subheader("📋 未來 24 小時預測數值明細")
+
+    df_display = pd.DataFrame(
+
+        {
+
+            "預測時間點": df_pred["target_datetime"].dt.strftime("%m/%d %H:00"),
+
+            "預測 PM2.5 (µg/m³)": df_pred["predicted_pm25"].round(2),
+
+        }
+
+    )
+
+    st.dataframe(df_display.T, use_container_width=True)
+
+
+
 
 
 if __name__ == "__main__":
-    main()
+
+    main() 
+
